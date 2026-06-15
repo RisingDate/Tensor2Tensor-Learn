@@ -13,52 +13,103 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utilities for attention."""
+"""注意力机制工具库（Attention Utilities）。
+
+本文件是 Tensor2Tensor 框架的核心注意力机制实现，包含：
+
+== 注意力偏置（Attention Bias）==
+用于控制注意力计算的掩码，主要类型：
+- attention_bias_lower_triangle：因果掩码（解码器自注意力，不看未来位置）
+- attention_bias_ignore_padding：忽略填充位置的掩码
+- attention_bias_local：局部注意力掩码（只看前后 N 个位置）
+- attention_bias_proximal：近端注意力偏置（距离越远权重越小）
+
+== 位置编码（Positional Encoding）==
+- get_timing_signal_1d / add_timing_signal_1d：正弦/余弦位置编码
+- add_positional_embedding：可学习的位置嵌入
+
+== 点积注意力（Dot-Product Attention）==
+- dot_product_attention：标准缩放点积注意力
+- dot_product_attention_relative：带相对位置编码的注意力
+
+== 多头注意力（Multi-Head Attention）==
+- multihead_attention：完整的多头注意力实现（自注意力 + 交叉注意力）
+- multihead_attention_2d：2D 图像的多头注意力
+
+== 局部注意力（Local Attention）==
+- masked_local_attention_1d：带掩码的 1D 局部注意力（解码器）
+- local_attention_1d：不带掩码的 1D 局部注意力（编码器）
+- local_attention_2d：2D 局部注意力
+
+== 稀疏注意力（Sparse Attention）==
+- sparse_dot_product_attention：稀疏点积注意力
+- dilated_self_attention_1d：膨胀自注意力
+
+== FFN 和工具函数 ==
+- compute_qkv：计算 Query、Key、Value 投影
+- ffn_self_attention_layer：带 FFN 的自注意力层
+- parameter_attention：参数注意力
+
+Transformer 架构中的注意力机制是整个框架的核心：
+1. 编码器使用双向自注意力（可以看全部输入序列）
+2. 解码器使用因果自注意力（只能看已生成的部分）
+3. 编码器-解码器注意力（解码器 Query，编码器输出 Key/Value）
+"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import collections
-import functools
-import itertools
-import math
-import operator
+import collections  # 有序字典、命名元组等
+import functools    # 高阶函数工具
+import itertools    # 迭代器工具
+import math         # 数学函数
+import operator     # 运算符函数
 
-import numpy as np
+import numpy as np  # 数值计算
 
-from six.moves import range  # pylint: disable=redefined-builtin
-from six.moves import zip  # pylint: disable=redefined-builtin
+from six.moves import range  # Python 2/3 兼容的 range  # pylint: disable=redefined-builtin
+from six.moves import zip    # Python 2/3 兼容的 zip  # pylint: disable=redefined-builtin
 
-from tensor2tensor.layers import area_attention
-from tensor2tensor.layers import common_layers
-from tensor2tensor.utils import contrib
-from tensor2tensor.utils import expert_utils
+from tensor2tensor.layers import area_attention   # 区域注意力实现
+from tensor2tensor.layers import common_layers    # 通用神经网络层
+from tensor2tensor.utils import contrib           # TF Contrib 兼容模块
+from tensor2tensor.utils import expert_utils      # 混合专家（MoE）工具
 
-import tensorflow.compat.v1 as tf
-import tensorflow_probability as tfp
+import tensorflow.compat.v1 as tf  # TensorFlow 1.x 兼容 API
+import tensorflow_probability as tfp  # 概率分布库
 
 # pylint: disable=g-direct-tensorflow-import
-from tensorflow.python.framework import function
-from tensorflow.python.ops import inplace_ops
+from tensorflow.python.framework import function  # TF 自定义函数
+from tensorflow.python.ops import inplace_ops     # 原地操作（TPU 推理优化）
 # pylint: enable=g-direct-tensorflow-import
 
 
 # TODO(lukaszkaiser): remove this function when not needed any more.
 def layers():
+  """获取适配 TF 1.x 和 TF 2.x 的 layers 模块（兼容包装器）。
+  
+  转发到 common_layers.layers()，确保代码在不同 TF 版本下都能正确获取 Keras/TF 层模块。
+  
+  Returns:
+    layers_module: tf.layers（TF1）或 tf.keras.layers（TF2）
+  """
   return common_layers.layers()
 
 
 def large_compatible_negative(tensor_type):
-  """Large negative number as Tensor.
+  """根据张量数据类型返回一个大负数（用于注意力掩码）。
 
-  This function is necessary because the standard value for epsilon
-  in this module (-1e9) cannot be represented using tf.float16
+  在注意力计算中，通过将不需要关注的位置的 logits 加上一个大负数（如 -1e9），
+  使该位置经过 softmax 后的概率接近 0，从而实现掩码效果。
+  
+  问题：标准的 -1e9 无法用 float16 表示（float16 最小值约为 -65504）。
+  解决方案：对 float16 类型使用 tf.float16.min 代替。
 
   Args:
-    tensor_type: a dtype to determine the type.
+    tensor_type: 张量数据类型（如 tf.float32 或 tf.float16）
 
   Returns:
-    a large negative number.
+    适合该数据类型的大负数（float32 返回 -1e9，float16 返回 tf.float16.min）
   """
   if tensor_type == tf.float16:
     return tf.float16.min
@@ -67,6 +118,23 @@ def large_compatible_negative(tensor_type):
 
 def mixed_precision_is_enabled(
     activation_dtype=None, weight_dtype=None, hparams=None):
+  """检查是否启用了混合精度训练（激活 float16 + 权重 float32）。
+  
+  混合精度训练是一种内存和速度优化技术：
+  - 激活值使用 float16（减少内存占用，加速计算）
+  - 权重保持 float32（保证梯度更新精度）
+  
+  Args:
+    activation_dtype: 激活值的数据类型（如 tf.float16）
+    weight_dtype: 权重的数据类型（如 tf.float32）
+    hparams: 可选的超参数对象（会覆盖 activation_dtype 和 weight_dtype）
+    
+  Returns:
+    bool: 如果启用混合精度训练（activation=float16, weight=float32）返回 True
+    
+  Raises:
+    AssertionError: 如果同时提供了 hparams 和 activation/weight_dtype
+  """
   assert not (hparams and (activation_dtype or weight_dtype)), (
       "Provide only hparams or activation_dtype and weight_dtype")
   if (hparams and hasattr(hparams, "activation_dtype") and
@@ -78,20 +146,38 @@ def mixed_precision_is_enabled(
 
 def maybe_upcast(logits,
                  activation_dtype=None, weight_dtype=None, hparams=None):
+  """在混合精度训练中将 logits 上转为 float32（避免 softmax 数值不稳定）。
+  
+  在混合精度训练中，注意力 logits 是 float16，但 softmax 需要 float32 才能稳定。
+  此函数在检测到混合精度模式时自动将 logits 转换为 float32。
+  
+  Args:
+    logits: 注意力分数张量
+    activation_dtype: 激活值的数据类型
+    weight_dtype: 权重的数据类型
+    hparams: 可选的超参数对象
+    
+  Returns:
+    float32 类型的 logits（如果是混合精度模式），否则返回原始 logits
+  """
   if mixed_precision_is_enabled(activation_dtype, weight_dtype, hparams):
     return tf.cast(logits, tf.float32)
   return logits
 
 
-# Struct containing the sequences ids and order on a batch (are send to the
-# expert to allow them to compute the bias mask)
+# 包含批次中序列 ID 和顺序的结构体，传送给专家（expert）以计算偏置掩码
+# coordinates: 批次坐标，用于区分不同序列
+# order: 序列在批次中的顺序
 BatchInfo = collections.namedtuple("BatchInfo", "coordinates, order")
 
+# 全局专家计数器，用于为每个专家生成唯一名称
 _expert_count = 0
 
 
 def get_standardized_layers(hparams, dp=None):
-  """Get the common attention and feed-forward layers.
+  """获取标准化的注意力和前馈层函数字典，统一函数签名为 (x) -> (y, extra_loss)。
+
+  Get the common attention and feed-forward layers.
 
   The returned layer functions will have the following signature:
 
@@ -302,7 +388,7 @@ def get_standardized_layers(hparams, dp=None):
 
 
 def add_standard_attention_hparams(hparams):
-  """Adds the hparams used by get_standardized_layers."""
+  """为 get_standardized_layers 注册所需的超参数（注意力层和前馈层参数）。"""
   # All hyperparameters ending in "dropout" are automatically set to 0.0
   # when not in training mode.
 
@@ -350,7 +436,9 @@ def encoder_decoder_attention_loss(expected_attention_logits,
                                    actual_attentions,
                                    loss_type="kl_divergence",
                                    loss_multiplier=1.0):
-  """Computes encdec attention loss between expected and actual attentions.
+  """计算编码器-解码器注意力的监督损失（期望注意力分布 vs 实际注意力分布）。
+
+  Computes encdec attention loss between expected and actual attentions.
 
   Args:
     expected_attention_logits: Tensor storing the expected encoder-decoder
@@ -410,7 +498,9 @@ def get_timing_signal_1d(length,
                          min_timescale=1.0,
                          max_timescale=1.0e4,
                          start_index=0):
-  """Gets a bunch of sinusoids of different frequencies.
+  """生成 1D 正弦/余弦位置编码信号，形状为 [1, length, channels]。
+
+  Gets a bunch of sinusoids of different frequencies.
 
   Each channel of the input Tensor is incremented by a sinusoid of a different
   frequency and phase.
@@ -461,7 +551,9 @@ def add_timing_signal_1d(x,
                          min_timescale=1.0,
                          max_timescale=1.0e4,
                          start_index=0):
-  """Adds a bunch of sinusoids of different frequencies to a Tensor.
+  """将正弦/余弦位置编码加到输入张量 x 上（标准 Transformer 位置编码）。
+
+  Adds a bunch of sinusoids of different frequencies to a Tensor.
 
   Each channel of the input Tensor is incremented by a sinusoid of a different
   frequency and phase.
@@ -498,7 +590,9 @@ def add_timing_signal_1d(x,
 
 @expert_utils.add_name_scope()
 def get_layer_timing_signal_learned_1d(channels, layer, num_layers):
-  """get n-dimensional embedding as the layer (vertical) timing signal.
+  """获取可学习的层级位置编码（Universal Transformer 中用于区分不同层的嵌入）。
+
+  get n-dimensional embedding as the layer (vertical) timing signal.
 
   Adds embeddings to represent the position of the layer in the tower.
 
@@ -522,7 +616,9 @@ def get_layer_timing_signal_learned_1d(channels, layer, num_layers):
 
 @expert_utils.add_name_scope()
 def add_layer_timing_signal_learned_1d(x, layer, num_layers):
-  """Add n-dimensional embedding as the layer (vertical) timing signal.
+  """将可学习的层级位置编码加到张量 x 上（Universal Transformer 层编号嵌入）。
+
+  Add n-dimensional embedding as the layer (vertical) timing signal.
 
   Adds embeddings to represent the position of the layer in the tower.
 
@@ -542,7 +638,9 @@ def add_layer_timing_signal_learned_1d(x, layer, num_layers):
 
 @expert_utils.add_name_scope()
 def get_layer_timing_signal_sinusoid_1d(channels, layer, num_layers):
-  """Add sinusoids of different frequencies as layer (vertical) timing signal.
+  """获取正弦形式的层级位置编码（用正弦函数区分不同 Transformer 层）。
+
+  Add sinusoids of different frequencies as layer (vertical) timing signal.
 
   Args:
     channels: dimension of the timing signal
@@ -561,7 +659,9 @@ def get_layer_timing_signal_sinusoid_1d(channels, layer, num_layers):
 
 @expert_utils.add_name_scope()
 def add_layer_timing_signal_sinusoid_1d(x, layer, num_layers):
-  """Add sinusoids of different frequencies as layer (vertical) timing signal.
+  """将正弦形式的层级位置编码加到张量 x 上。
+
+  Add sinusoids of different frequencies as layer (vertical) timing signal.
 
   Args:
     x: a Tensor with shape [batch, length, channels]
@@ -583,7 +683,9 @@ def add_timing_signals_given_positions(x,
                                        positions,
                                        min_timescale=1.0,
                                        max_timescale=1.0e4):
-  """Adds sinusoids of diff frequencies to a Tensor, with timing positions given.
+  """根据给定的位置索引（而非默认的 0..length-1）添加多维正弦位置编码。
+
+  Adds sinusoids of diff frequencies to a Tensor, with timing positions given.
 
   Args:
     x: a Tensor with shape [batch, length, channels]
@@ -629,7 +731,9 @@ def add_timing_signals_from_features(x,
                                      position_features,
                                      min_timescale=1.0,
                                      max_timescale=1.0e4):
-  """Adds timing signals from features named in `position_features`.
+  """从 features 字典中取出指定位置特征，添加对应的正弦位置编码。
+
+  Adds timing signals from features named in `position_features`.
 
   Args:
     x: a Tensor with shape [batch, length, channels]
@@ -654,7 +758,9 @@ def add_timing_signal_1d_given_position(x,
                                         position,
                                         min_timescale=1.0,
                                         max_timescale=1.0e4):
-  """Adds sinusoids of diff frequencies to a Tensor, with timing position given.
+  """根据给定的位置张量（非默认顺序）添加 1D 正弦位置编码（解码阶段逐步生成时使用）。
+
+  Adds sinusoids of diff frequencies to a Tensor, with timing position given.
 
   Args:
     x: a Tensor with shape [batch, length, channels]
@@ -683,7 +789,9 @@ def add_timing_signal_1d_given_position(x,
 
 @expert_utils.add_name_scope()
 def add_timing_signal_nd(x, min_timescale=1.0, max_timescale=1.0e4):
-  """Adds a bunch of sinusoids of different frequencies to a Tensor.
+  """为 n 维张量（如图像 2D、视频 3D）添加多维正弦位置编码。
+
+  Adds a bunch of sinusoids of different frequencies to a Tensor.
 
   Each channel of the input Tensor is incremented by a sinusoid of a different
   frequency and phase in one of the positional dimensions.
@@ -739,7 +847,9 @@ def add_timing_signal_nd(x, min_timescale=1.0, max_timescale=1.0e4):
 
 
 def add_positional_embedding(x, max_length, name=None, positions=None):
-  """Adds positional embedding.
+  """添加可学习的 1D 位置嵌入（每个位置学一个向量，与正弦编码相对）。
+
+  Adds positional embedding.
 
   Args:
     x: Tensor with shape [batch, length, depth].
@@ -765,7 +875,9 @@ def add_positional_embedding(x, max_length, name=None, positions=None):
 
 
 def add_positional_embedding_nd(x, max_length, name=None):
-  """Adds n-dimensional positional embedding.
+  """为 n 维序列（如图像、视频）的每个空间维度添加可学习位置嵌入。
+
+  Adds n-dimensional positional embedding.
 
   The embeddings add to all positional dimensions of the tensor.
 
@@ -801,7 +913,9 @@ def add_positional_embedding_nd(x, max_length, name=None):
 
 
 def make_edge_vectors(adjacency_matrix, num_edge_types, depth, name=None):
-  """Gets edge vectors for the edge types in the adjacency matrix.
+  """根据邻接矩阵中的边类型生成边向量（用于图注意力网络的关系建模）。
+
+  Gets edge vectors for the edge types in the adjacency matrix.
 
   Args:
     adjacency_matrix: A [batch, num_nodes, num_nodes] tensor of ints.
@@ -835,7 +949,7 @@ def make_edge_vectors(adjacency_matrix, num_edge_types, depth, name=None):
 
 
 class LshGating(object):
-  """Class to split key/queries into separate buckets."""
+  """LSH（局部敏感哈希）门控类，将 key/query 分屏到不同桶中，实现稀疏注意力。"""
 
   def __init__(self, depth, nb_hyperplanes, nb_replicat=1, trainable=False):
     """Construct the gating function parameters.
@@ -916,7 +1030,9 @@ class LshGating(object):
 
 @expert_utils.add_name_scope()
 def embedding_to_padding(emb):
-  """Calculates the padding mask based on which embeddings are all zero.
+  """根据嵌入向量是否全零来计算填充掩码（填充位置为 1，其余为 0）。
+
+  Calculates the padding mask based on which embeddings are all zero.
 
   We have hacked symbol_modality to return all-zero embeddings for padding.
 
@@ -933,7 +1049,9 @@ def embedding_to_padding(emb):
 
 @expert_utils.add_name_scope()
 def padding_to_length(padding):
-  """Calculate the length of mask based on padding.
+  """根据填充掩码计算序列实际长度（非填充位置的数量）。
+
+  Calculate the length of mask based on padding.
 
   Args:
     padding: a Tensor with shape [..., length].
@@ -946,7 +1064,9 @@ def padding_to_length(padding):
 
 @expert_utils.add_name_scope()
 def attention_bias_local(length, max_backward, max_forward):
-  """Create an bias tensor to be added to attention logits.
+  """生成局部注意力偏置（每个位置只能看前后指定范围内的位置）。
+
+  Create an bias tensor to be added to attention logits.
 
   A position may attend to positions at most max_distance from it,
   forward and backwards.
@@ -974,7 +1094,9 @@ def attention_bias_local(length, max_backward, max_forward):
 
 @expert_utils.add_name_scope()
 def attention_bias_lower_triangle(length):
-  """Create an bias tensor to be added to attention logits.
+  """生成因果掩码（下三角掩码），使解码器只能看到当前及之前的位置。
+
+  Create an bias tensor to be added to attention logits.
 
   Allows a query to attend to all positions up to and including its own.
 
@@ -989,7 +1111,9 @@ def attention_bias_lower_triangle(length):
 
 @expert_utils.add_name_scope()
 def attention_bias_same_segment(query_segment_id, memory_segment_id):
-  """Create an bias tensor to be added to attention logits.
+  """生成跨段掩码，只允许相同段（segment_id）内的位置相互注意（用于 BERT 类双句任务）。
+
+  Create an bias tensor to be added to attention logits.
 
   Positions with the same segment_ids can see each other.
 
@@ -1010,7 +1134,9 @@ def attention_bias_same_segment(query_segment_id, memory_segment_id):
 
 @expert_utils.add_name_scope()
 def attention_bias_ignore_padding(memory_padding):
-  """Create an bias tensor to be added to attention logits.
+  """生成填充掩码偏置，使注意力计算忽略 memory 中的填充位置。
+
+  Create an bias tensor to be added to attention logits.
 
   Args:
     memory_padding: a float `Tensor` with shape [batch, memory_length].
@@ -1025,7 +1151,9 @@ def attention_bias_ignore_padding(memory_padding):
 @expert_utils.add_name_scope()
 def attention_bias_to_padding(attention_bias,
                               cast_fn=(lambda x: tf.cast(x, tf.float32))):
-  """Inverse of attention_bias_ignore_padding().
+  """`attention_bias_ignore_padding()` 的逆运算，将填充偏置转回填充掩码张量。
+
+  Inverse of attention_bias_ignore_padding().
 
   Args:
     attention_bias: a `Tensor` with shape [batch, 1, 1, memory_length], as
@@ -1043,7 +1171,9 @@ def attention_bias_to_padding(attention_bias,
 
 @expert_utils.add_name_scope()
 def attention_bias_prepend_inputs_full_attention(padding):
-  """Create a bias tensor for prepend_mode="prepend_inputs_full_attention".
+  """为 "prepend_inputs_full_attention" 模式生成偏置张量（输入部分全连接，输出部分因果注意）。
+
+  Create a bias tensor for prepend_mode="prepend_inputs_full_attention".
 
   See prepend_inputs in common_hparams.py.
 
@@ -1077,7 +1207,9 @@ def attention_bias_prepend_inputs_full_attention(padding):
 
 @expert_utils.add_name_scope()
 def attention_bias_proximal(length):
-  """Bias for self-attention to encourage attention to close positions.
+  """生成近端偏置，鼓励自注意力关注距离较近的位置（距离越远权重越小）。
+
+  Bias for self-attention to encourage attention to close positions.
 
   Args:
     length: an integer scalar.
@@ -1094,7 +1226,9 @@ def attention_bias_proximal(length):
 def attention_bias_batch(batch_coordinates_q,
                          batch_coordinates_k=None,
                          condition_fn=None):
-  """Generate a mask to prevent the batch to attend to each others.
+  """生成批次掩码，防止同一批次中不同序列相互注意（用于将多条序列并排后的批量处理）。
+
+  Generate a mask to prevent the batch to attend to each others.
 
   Args:
     batch_coordinates_q: Int-like Tensor of shape [length_q, 1] containing the
@@ -1143,7 +1277,9 @@ attention_bias_future = functools.partial(
 
 @expert_utils.add_name_scope()
 def split_last_dimension(x, n):
-  """Reshape x so that the last dimension becomes two dimensions.
+  """将张量最后一维分裂为两维，第一维大小为 n（多头注意力拆分头数时使用）。
+
+  Reshape x so that the last dimension becomes two dimensions.
 
   The first of these two dimensions is n.
 
@@ -1163,7 +1299,9 @@ def split_last_dimension(x, n):
 
 @expert_utils.add_name_scope()
 def combine_last_two_dimensions(x):
-  """Reshape x so that the last two dimension become one.
+  """将张量最后两维合并为一维（多头注意力合并头数时使用）。
+
+  Reshape x so that the last two dimension become one.
 
   Args:
     x: a Tensor with shape [..., a, b]
@@ -1178,7 +1316,9 @@ def combine_last_two_dimensions(x):
 
 @expert_utils.add_name_scope()
 def combine_first_two_dimensions(x):
-  """Reshape x so that the first two dimension become one.
+  """将张量前两维合并为一维（将 batch 和 heads 合并，方便批量运算）。
+
+  Reshape x so that the first two dimension become one.
 
   Args:
     x: a Tensor with shape [a, b, ...]
@@ -1196,7 +1336,9 @@ def combine_first_two_dimensions(x):
 
 @expert_utils.add_name_scope()
 def split_heads(x, num_heads):
-  """Split channels (dimension 2) into multiple heads (becomes dimension 1).
+  """将通道维（第 2 维）分裂成多头（成为第 1 维）。形状变化：[batch, length, channels] → [batch, heads, length, channels/heads]。
+
+  Split channels (dimension 2) into multiple heads (becomes dimension 1).
 
   Args:
     x: a Tensor with shape [batch, length, channels]
@@ -1210,7 +1352,9 @@ def split_heads(x, num_heads):
 
 @expert_utils.add_name_scope()
 def split_heads_2d(x, num_heads):
-  """Split channels (dimension 3) into multiple heads (becomes dimension 1).
+  """将 2D 张量通道维分裂成多头（用于图像注意力）。
+
+  Split channels (dimension 3) into multiple heads (becomes dimension 1).
 
   Args:
     x: a Tensor with shape [batch, height, width, channels]
@@ -1223,7 +1367,9 @@ def split_heads_2d(x, num_heads):
 
 
 def split_heads_nd(x, num_heads):
-  """Split the depth dimension (last dimension) into multiple heads.
+  """将 n 维张量的深度维（最后一维）分裂成多头（通用多维注意力头分裂）。
+
+  Split the depth dimension (last dimension) into multiple heads.
 
   Args:
     x: a [batch, d1, ..., dn, depth] tensor
@@ -1240,7 +1386,9 @@ def split_heads_nd(x, num_heads):
 
 @expert_utils.add_name_scope()
 def combine_heads(x):
-  """Inverse of split_heads.
+  """split_heads 的逆操作，将多头张量合并回来。形状变化：[batch, heads, length, ch/heads] → [batch, length, ch]。
+
+  Inverse of split_heads.
 
   Args:
     x: a Tensor with shape [batch, num_heads, length, channels / num_heads]
@@ -1253,7 +1401,9 @@ def combine_heads(x):
 
 @expert_utils.add_name_scope()
 def combine_heads_2d(x):
-  """Inverse of split_heads_2d.
+  """split_heads_2d 的逆操作，将 2D 张量多头合并回来。
+
+  Inverse of split_heads_2d.
 
   Args:
     x: a Tensor with shape
@@ -1266,7 +1416,9 @@ def combine_heads_2d(x):
 
 
 def combine_heads_nd(x):
-  """Inverse of split_heads_nd.
+  """split_heads_nd 的逆操作，将 n 维张量多头合并回来。
+
+  Inverse of split_heads_nd.
 
   Args:
     x: a [batch, num_heads, d1, ..., dn, depth // num_heads] tensor
@@ -1281,7 +1433,9 @@ def combine_heads_nd(x):
 
 
 def attention_image_summary(attn, image_shapes=None):
-  """Compute color image summary.
+  """将注意力权重可视化为彩色图像并输出到 TensorBoard，每个头对应 RGB 通道之一。
+
+  Compute color image summary.
 
   Args:
     attn: a Tensor with shape [batch, num_heads, query_length, memory_length]
@@ -1337,7 +1491,9 @@ def grouped_attention_multihead(query_antecedent,
                                 mask_right=False,
                                 make_image_summary=True,
                                 name=None):
-  """Multi-head dot-product attention with sparsity.
+  """带稀疏性的多头点积注意力：Query 分组，每组只计算部分 key-value 对，降低计算复杂度。
+
+  Multi-head dot-product attention with sparsity.
 
   For each attention head, the queries are partitioned into groups.
   For each group, only a subset of the key-value pairs are considered.
@@ -1580,7 +1736,7 @@ def grouped_attention_multihead(query_antecedent,
 
 
 def harden_attention_weights(weights, k, gumbel_noise_weight):
-  """Make attention weights non-0 only on the top k ones."""
+  """将注意力权重硬化为只保留 top-k 个非零权重（硬注意力），可选添加 Gumbel 噪声。"""
   if gumbel_noise_weight > 0.:
     gumbel_noise = -tf.log(-tf.log(tf.random_uniform(tf.shape(weights),
                                                      minval=1e-5,
@@ -1613,7 +1769,9 @@ def dot_product_attention(q,
                           weight_dtype=None,
                           hard_attention_k=0,
                           gumbel_noise_weight=0.0):
-  """Dot-product attention.
+  """标准缩放点积注意力：logits = QK^T / sqrt(d)  →  softmax  →  加权求和 V。
+
+  Dot-product attention.
 
   Args:
     q: Tensor with shape [..., length_q, depth_k].
@@ -1670,7 +1828,7 @@ def dot_product_attention(q,
 def _generate_relative_positions_matrix(length_q, length_k,
                                         max_relative_position,
                                         cache=False):
-  """Generates matrix of relative positions between inputs."""
+  """生成相对位置矩阵，值为 query 与 key 之间的相对距离（被裁剪到 max_relative_position 范围）。"""
   if not cache:
     if length_q == length_k:
       range_vec_q = range_vec_k = tf.range(length_q)
@@ -1691,7 +1849,7 @@ def _generate_relative_positions_matrix(length_q, length_k,
 def _generate_relative_positions_embeddings(length_q, length_k, depth,
                                             max_relative_position, name,
                                             cache=False):
-  """Generates tensor of size [1 if cache else length_q, length_k, depth]."""
+  """生成相对位置嵌入张量，形状为 [1 if cache else length_q, length_k, depth]。"""
   with tf.variable_scope(name):
     relative_positions_matrix = _generate_relative_positions_matrix(
         length_q, length_k, max_relative_position, cache=cache)
@@ -1703,7 +1861,9 @@ def _generate_relative_positions_embeddings(length_q, length_k, depth,
 
 
 def _relative_attention_inner(x, y, z, transpose):
-  """Relative position-aware dot-product attention inner calculation.
+  """相对位置内积计算：将张量 x、y 的矩阵乘与相对位置嵌入 z 的内积相加（避免广播）。
+
+  Relative position-aware dot-product attention inner calculation.
 
   This batches matrix multiply calculations to avoid unnecessary broadcasting.
 
@@ -1750,7 +1910,9 @@ def dot_product_attention_relative(q,
                                    allow_memory=False,
                                    hard_attention_k=0,
                                    gumbel_noise_weight=0.0):
-  """Calculate relative position-aware dot-product self-attention.
+  """带相对位置嵌入的点积自注意力（Shaw et al. 2018），在注意力分数中加入相对位置嵌入。
+
+  Calculate relative position-aware dot-product self-attention.
 
   The attention calculation is augmented with learned representations for the
   relative position between each element in q and each element in k and v.
@@ -1828,7 +1990,9 @@ def dot_product_attention_relative(q,
 
 
 def _relative_position_to_absolute_position_masked(x):
-  """Helper to dot_product_self_attention_relative_v2.
+  """将相对位置的注意力转换为绝对位置表示（掉果版，用于加速带相对嵌入的注意力计算）。
+
+  Helper to dot_product_self_attention_relative_v2.
 
   Rearrange an attention logits or weights Tensor.
 
@@ -1855,7 +2019,9 @@ def _relative_position_to_absolute_position_masked(x):
 
 
 def _absolute_position_to_relative_position_masked(x):
-  """Helper to dot_product_self_attention_relative_v2.
+  """将绝对位置的注意力转换为相对位置表示（掉果版，带相对嵌入注意力的逆操作）。
+
+  Helper to dot_product_self_attention_relative_v2.
 
   Rearrange an attention logits or weights Tensor.
 
@@ -1884,7 +2050,9 @@ def _absolute_position_to_relative_position_masked(x):
 def get_relative_embeddings_left(max_relative_position, length, depth,
                                  num_heads, heads_share_relative_embedding,
                                  name):
-  """Instantiate or retrieve relative embeddings, sliced according to length.
+  """获取或创建相对位置嵌入（仅向左看，用于掉果自注意力），根据序列长度裁剪。
+
+  Instantiate or retrieve relative embeddings, sliced according to length.
 
   Use for masked case where the relative attention is only looking left.
 
@@ -1944,7 +2112,9 @@ def dot_product_self_attention_relative_v2(q,
                                            dropout_broadcast_dims=None,
                                            heads_share_relative_embedding=False,
                                            add_relative_to_values=False):
-  """Calculate relative position-aware dot-product self-attention.
+  """带相对位置嵌入的的点积自注意力 v2（掉果版），使用内存不变空间的高效实现。
+
+  Calculate relative position-aware dot-product self-attention.
 
   Only works for masked self-attention (no looking forward).
 
@@ -2033,7 +2203,9 @@ def dot_product_self_attention_relative_v2(q,
 
 
 def _absolute_position_to_relative_position_unmasked(x):
-  """Helper function for dot_product_unmasked_self_attention_relative_v2.
+  """将绝对位置注意力转换为相对位置表示（无掉果版，双向相对注意力的辅助函数）。
+
+  Helper function for dot_product_unmasked_self_attention_relative_v2.
 
   Rearrange an attention logits or weights Tensor.
 
@@ -2067,7 +2239,9 @@ def get_relative_embeddings_left_right(max_relative_position, length, depth,
                                        num_heads,
                                        heads_share_relative_embedding,
                                        name):
-  """Instantiate or retrieve relative embeddings, sliced according to length.
+  """获取或创建相对位置嵌入（左右双向看，用于非掉果自注意力），根据序列长度裁剪。
+
+  Instantiate or retrieve relative embeddings, sliced according to length.
 
   Use for unmasked case where the relative attention looks both left and right.
 
@@ -2120,7 +2294,9 @@ def dot_product_unmasked_self_attention_relative_v2(
     image_shapes=None, save_weights_to=None, name=None, make_image_summary=True,
     dropout_broadcast_dims=None, heads_share_relative_embedding=False,
     add_relative_to_values=False):
-  """Calculate relative position-aware dot-product self-attention.
+  """带相对位置嵌入的点积自注意力 v2（非掉果，双向相对位置，用于编码器自注意力）。
+
+  Calculate relative position-aware dot-product self-attention.
 
   The attention calculation is augmented with learned representations for the
   relative position between each element in q and each element in k and v.
@@ -2214,7 +2390,7 @@ def dot_product_unmasked_self_attention_relative_v2(
 
 
 def _matmul_with_relative_keys_2d(x, y, heads_share_relative_embedding):
-  """Helper function for dot_product_unmasked_self_attention_relative_2d."""
+  """二维相对位置的矩阵乘辅助函数，使用 einsum 计算二维空间相对注意力得分。"""
   if heads_share_relative_embedding:
     ret = tf.einsum("bhxyd,md->bhxym", x, y)
   else:
@@ -2227,7 +2403,9 @@ def dot_product_unmasked_self_attention_relative_2d(
     image_shapes=None, name=None, make_image_summary=True,
     dropout_broadcast_dims=None, heads_share_relative_embedding=False,
     add_relative_to_values=False):
-  """Calculate relative position unmasked dot-product self-attention 2d.
+  """二维相对位置自注意力（高度+宽度双维度相对嵌入，用于图像 Transformer）。
+
+  Calculate relative position unmasked dot-product self-attention 2d.
 
 
   The attention calculation is augmented with learned representations for the
@@ -2365,7 +2543,9 @@ def dot_product_unmasked_self_attention_relative_2d(
 
 
 def _split_along_width(x_left_right_blocks):
-  """Helper function for local 2d attention.
+  """水平分裂辅助函数：将宽度方向的记忆块按奇偶位置分为左和右两部分（用于 2D 局部注意力）。
+
+  Helper function for local 2d attention.
 
   Takes a tensor of [batch, heads, num_h_blocks, num_w_blocks,
   height, width, depth] and returns two tensors which contain every alternate
@@ -2405,7 +2585,9 @@ def _split_along_width(x_left_right_blocks):
 
 
 def _get_left_right_blocks(x):
-  """Helper function. Assumes that memory_flange is half of query sizes.
+  """获取左右记忆块的辅助函数，假设 memory_flange 为 query 大小的一半。
+
+  Helper function. Assumes that memory_flange is half of query sizes.
 
   This function splits the tensor of width 'n' into two halves, where the
   first half gets the width indices 0, 2, 4.. and the second half gets the
@@ -2444,7 +2626,9 @@ def _get_left_right_blocks(x):
 
 
 def _extract_blocks(x, block_h, block_w):
-  """Helper function for local 2d attention.
+  """二维局部注意力辅助函数：将张量按块大小裂块，用于构建局部注意力所需的内存块。
+
+  Helper function for local 2d attention.
 
   Args:
     x: a [batch, height, width, depth] tensor
@@ -2463,7 +2647,9 @@ def _extract_blocks(x, block_h, block_w):
 
 
 def get_2d_local_memory(x, query_shape, memory_flange):
-  """Stitches together the local 2d memory blocks.
+  """拼接局部 2D 记忆块：每个 query 块拼播周围的记忆块（包括上下左右及角落）。
+
+  Stitches together the local 2d memory blocks.
 
   Args:
     x: a [batch, height, width, depth tensor]
@@ -2544,7 +2730,9 @@ def get_2d_local_memory(x, query_shape, memory_flange):
 
 
 def get_2d_local_memory_v2(x, query_shape, memory_flange):
-  """Gathering memory blocks around query blocks. flange is half of query .
+  """局部 2D 记忆块的汇聚函数 v2（要求 memory_flange 为 query 大小的一半）。
+
+  Gathering memory blocks around query blocks. flange is half of query .
 
     Only works if memory flanges are half of query sizes.
 
@@ -2588,7 +2776,9 @@ def dot_product_unmasked_attention_local_2d_tpu(
     q, k, v, bias, max_relative_position=None, query_shape=(8, 8),
     dropout_rate=0.0, image_shapes=None, name=None, make_image_summary=False,
     dropout_broadcast_dims=None):
-  """Calculate unmasked dot-product local self-attention 2d on tpu.
+  """在 TPU 上计算 2D 非掉果局部点积自注意力（每个 query 块只看周围记忆块）。
+
+  Calculate unmasked dot-product local self-attention 2d on tpu.
 
   Args:
     q: a Tensor with shape [batch, heads, height, width, depth].
@@ -2682,7 +2872,9 @@ def dot_product_unmasked_attention_local_2d_tpu_simple(
     dropout_rate=0.0, image_shapes=None, make_image_summary=False,
     dropout_broadcast_dims=None):
 
-  """Calculate simple unmasked dot-product local self-attention 2d on tpu.
+  """在 TPU 上计算简化版 2D 非掉果局部点积自注意力（QKV 共享，无线性变换）。
+
+  Calculate simple unmasked dot-product local self-attention 2d on tpu.
 
   The query, key, and value blocks are the same. We do not do a second linear
   transformation after computing the values
@@ -2755,7 +2947,9 @@ def dot_product_unmasked_attention_local_2d_tpu_simple(
 
 
 def masked_within_block_local_attention_1d(q, k, v, block_length=64, name=None):
-  """Attention to the source and a neighborhood to the left within a block.
+  """块内掉果局部自注意力：不跨块，每个 query 只看当前块内之前的位置（调试/简化版）。
+
+  Attention to the source and a neighborhood to the left within a block.
 
   The sequence is divided into blocks of length block_length. Attention for a
   given query position can only see memory positions less than or equal to the
@@ -2811,7 +3005,9 @@ def masked_within_block_local_attention_1d(q, k, v, block_length=64, name=None):
 
 
 def _relative_position_to_absolute_position_unmasked(x):
-  """Converts tensor from relative to aboslute indexing for local attention.
+  """将相对位置索引转换为绝对位置索引（用于局部注意力）。
+
+  Converts tensor from relative to aboslute indexing for local attention.
 
   Args:
     x: a Tensor of shape [batch (or batch*num_blocks), heads,
@@ -2847,7 +3043,9 @@ def masked_local_attention_1d(q,
                               make_image_summary=False,
                               dropout_rate=0.,
                               name=None):
-  """Attention to the source position and a neighborhood to the left of it.
+  """掉果 1D 局部自注意力：序列分块，每个 query 只看当前块和前一块中小于等于自己的位置。
+
+  Attention to the source position and a neighborhood to the left of it.
 
   The sequence is divided into blocks of length block_length. Attention for a
   given query position can only see memory positions less than or equal to the
@@ -2952,7 +3150,7 @@ def masked_local_attention_1d(q,
 
 
 def _make_local_block(x, depth, batch, heads, num_blocks, block_length):
-  """Helper function to create a local version of the keys or values for 1d."""
+  """辅助函数：将 1D 局部注意力的 key/value 局部化，将每块与前一块拼接作为该块的局部记忆。"""
   prev_block = tf.slice(x, [0, 0, 0, 0, 0],
                         [-1, -1, num_blocks - 1, -1, -1])
   cur_block = tf.slice(x, [0, 0, 1, 0, 0], [-1, -1, -1, -1, -1])
@@ -2970,7 +3168,9 @@ def masked_relative_local_attention_1d(q,
                                        heads_share_relative_embedding=False,
                                        add_relative_to_values=False,
                                        name=None):
-  """Masked local 1d attention with relative positions.
+  """带相对位置嵌入的掉果 1D 局部自注意力：分块并加入相对位置信息。
+
+  Masked local 1d attention with relative positions.
 
   The sequence is divided into blocks of length block_size.
   Attention for a given query position can only see memory positions
@@ -3173,6 +3373,7 @@ def masked_relative_local_attention_1d(q,
 
 
 def matmul_with_relative_values(x, y, heads_share_relative_embedding):
+  """用注意力权重矩阵与相对位置 value 嵌入做内积，输出相对位置加权和。"""
   if heads_share_relative_embedding:
     ret = tf.einsum("bhlm,md->bhld", x, y)
   else:
@@ -3181,6 +3382,7 @@ def matmul_with_relative_values(x, y, heads_share_relative_embedding):
 
 
 def matmul_with_relative_keys(x, y, heads_share_relative_embedding):
+  """用 query 与相对位置 key 嵌入做内积，输出相对位置得分。"""
   if heads_share_relative_embedding:
     ret = tf.einsum("bhld,md->bhlm", x, y)
   else:
@@ -3189,7 +3391,9 @@ def matmul_with_relative_keys(x, y, heads_share_relative_embedding):
 
 
 def local_attention_1d(q, k, v, block_length=128, filter_width=100, name=None):
-  """Strided block local self-attention.
+  """步进分块 1D 局部自注意力：每个 query 块可看到对应块及左右 filter_width 个位置。
+
+  Strided block local self-attention.
 
   The sequence is divided into blocks of length block_length. Attention for a
   given query position can see all memory positions in the corresponding block
@@ -3294,7 +3498,9 @@ def local_attention_1d(q, k, v, block_length=128, filter_width=100, name=None):
 
 
 def reshape_by_blocks(x, x_shape, memory_block_size):
-  """Reshapes input by splitting its length over blocks of memory_block_size.
+  """将序列长度分块，张量形状转换为 [batch, heads, blocks, block_size, depth]。
+
+  Reshapes input by splitting its length over blocks of memory_block_size.
 
   Args:
     x: a Tensor with shape [batch, heads, length, depth]
@@ -3320,7 +3526,9 @@ def dilated_self_attention_1d(q,
                               gap_size=2,
                               num_memory_blocks=2,
                               name=None):
-  """Dilated self-attention.
+  """膨胀自注意力：每块抓取快速跟踈的间隔记忆块，扩大感受野且省内存。
+
+  Dilated self-attention.
 
   Args:
     q: a Tensor with shape [batch, heads, length, depth]
@@ -3439,7 +3647,9 @@ def gather_dilated_memory_blocks(x,
                                  memory_block_size,
                                  gather_indices,
                                  direction="left"):
-  """Gathers blocks with gaps in between.
+  """收集膨胀内存块：按对应的间隔和步进连续抓取多个记忆块。
+
+  Gathers blocks with gaps in between.
 
   Args:
     x: Tensor of shape [length, batch, heads, depth]
@@ -3486,7 +3696,9 @@ def masked_dilated_self_attention_1d(q,
                                      gap_size=2,
                                      num_memory_blocks=2,
                                      name=None):
-  """Dilated self-attention. TODO(avaswani): Try it and write a paper on it.
+  """掉果膨胀自注意力：序列分块，仅看左侧以间隔计算的记忆块，用于解码器。
+
+  Dilated self-attention. TODO(avaswani): Try it and write a paper on it.
 
   Args:
     q: a Tensor with shape [batch, heads, length, depth]
@@ -3597,7 +3809,9 @@ def local_attention_2d(q,
                        query_shape=(8, 16),
                        memory_flange=(8, 16),
                        name=None):
-  """Strided block local self-attention.
+  """步进分块 2D 局部自注意力：每个 query 块可看周围 memory_flange 范围的内存（图像 Transformer）。
+
+  Strided block local self-attention.
 
   The 2-D sequence is divided into 2-D blocks of shape query_shape. Attention
   for a given query position can only see memory positions less than or equal to
@@ -3663,7 +3877,9 @@ def local_attention_2d(q,
 
 
 def pad_to_multiple_2d(x, block_shape):
-  """Making sure x is a multiple of shape.
+  """将 2D 张量填充至块大小的整数倍，以应对 2D 局部注意力分块需求。
+
+  Making sure x is a multiple of shape.
 
   Args:
     x: a [batch, heads, h, w, depth] or [batch, h, w, depth] tensor
@@ -3691,14 +3907,14 @@ def pad_to_multiple_2d(x, block_shape):
 
 
 def reshape_range(tensor, i, j, shape):
-  """Reshapes a tensor between dimensions i and j."""
+  """将张量第 i 到第 j 维之间的尺寸按 shape 进行 reshape。"""
   t_shape = common_layers.shape_list(tensor)
   target_shape = t_shape[:i] + shape + t_shape[j:]
   return tf.reshape(tensor, target_shape)
 
 
 def gather_blocks_2d(x, indices):
-  """Gathers flattened blocks from x."""
+  """从 2D 张量中按索引收集平坦化的块（用于 2D 局部注意力的模块收集）。"""
   x_shape = common_layers.shape_list(x)
   x = reshape_range(x, 2, 4, [tf.reduce_prod(x_shape[2:4])])
   # [length, batch, heads, dim]
@@ -3709,7 +3925,7 @@ def gather_blocks_2d(x, indices):
 
 
 def scatter_blocks_2d(x, indices, shape):
-  """scatters blocks from x into shape with indices."""
+  """将块数据按索引射入到指定形状的张量中（scatter 操作，用于 2D 局郠注意力输出恢复）。"""
   x_shape = common_layers.shape_list(x)
   # [length, batch, heads, dim]
   x_t = tf.transpose(
@@ -3722,7 +3938,7 @@ def scatter_blocks_2d(x, indices, shape):
 
 
 def gather_indices_2d(x, block_shape, block_stride):
-  """Getting gather indices."""
+  """计算 2D 局部注意力所需的收集索引（用卷积实现滑动窗口索引）。"""
   # making an identity matrix kernel
   kernel = tf.eye(block_shape[0] * block_shape[1])
   kernel = reshape_range(kernel, 0, 1, [block_shape[0], block_shape[1], 1])
@@ -3746,7 +3962,9 @@ def gather_indices_2d(x, block_shape, block_stride):
 
 
 def make_2d_block_raster_mask(query_shape, memory_flange):
-  """Creates a mask for 2d block raster scan.
+  """创建 2D 块光栅扫描注意力掩码，每个 query 可看左、左上、正上和右上，不可看右侧。
+
+  Creates a mask for 2d block raster scan.
 
   The query mask can look to the left, top left, top, and top right, but
   not to the right. Inside the query, we have the standard raster scan
@@ -3786,7 +4004,9 @@ def make_2d_block_raster_mask(query_shape, memory_flange):
 
 
 def get_memory_region(x, query_block_shape, memory_flange, q_indices):
-  """Get the memory regions that surround a 2d query.
+  """获取 2D query 周围的记忆区域（左侧和上方），以及 query 块自身。
+
+  Get the memory regions that surround a 2d query.
 
     The memory regions will be the left and top right.
 
@@ -3840,7 +4060,9 @@ def get_memory_region(x, query_block_shape, memory_flange, q_indices):
 
 
 def get_shifted_center_blocks(x, indices):
-  """Get right shifted blocks for masked local attention 2d.
+  """获取右移的中心块，用于掉果 2D 局部注意力（防止移存未来信息）。
+
+  Get right shifted blocks for masked local attention 2d.
 
   Args:
     x: A tensor with shape [batch, heads, height, width, depth]
@@ -3864,7 +4086,9 @@ def get_shifted_center_blocks(x, indices):
 
 
 def right_shift_blockwise(x, query_shape, name=None):
-  """Right shifts once in every block.
+  """在每个块中执行一次向右移位，用于掉果 2D 局郠注意力的自回归序列生成。
+
+  Right shifts once in every block.
 
   Args:
     x: a tensor of shape [batch, height, width, depth]
@@ -3897,7 +4121,9 @@ def right_shift_blockwise(x, query_shape, name=None):
 
 
 def right_shift_blockwise_nd(x, block_shape):
-  """Right shift once in every block.
+  """在 n 维张量的每个块中执行一次向右移位，用于 n 维掉果局郠注意力的自回归生成。
+
+  Right shift once in every block.
 
   Args:
     x: a [batch, d1, d2, ..., dn, depth] tensor
@@ -3923,7 +4149,9 @@ def masked_local_attention_2d(q,
                               query_shape=(8, 16),
                               memory_flange=(8, 16),
                               name=None):
-  """Strided block local self-attention.
+  """掉果步进 2D 局郠自注意力：每个位置可看光栅扫描顺序上已生成的 query 块和左上方。
+
+  Strided block local self-attention.
 
   Each position in a query block can attend to all the generated queries in
   the query block, which are generated in raster scan, and positions that are
@@ -4017,7 +4245,9 @@ def masked_local_attention_nd(q,
                               memory_flange,
                               decode_step=None,
                               name=None):
-  """Masked local attention nd.
+  """掉果 n 维局郠注意力：序列分块，每个位置只看小于等于自身的位置（支持快速解码）。
+
+  Masked local attention nd.
 
   Each position in q can attend to positions in memory that are positioned less
   than or equal to query position according to raster scan ordering and are in
@@ -4135,7 +4365,9 @@ def masked_local_attention_nd(q,
 
 
 def select_block_for_decode_step(blocked_x, decode_step, query_shape):
-  """Selects one block from `x` that contains position `decode_step`.
+  """在快速解码模式中，选取包含 `decode_step` 位置的块。
+
+  Selects one block from `x` that contains position `decode_step`.
 
   NOTE: This method only works for blocked inputs. It selects one block around
   `decode_step` position in blocked raster scan order.
@@ -4164,7 +4396,9 @@ def select_block_for_decode_step(blocked_x, decode_step, query_shape):
 
 
 def flatten_blocks_nd(x):
-  """Flattens blocks of the input tensor.
+  """将 n 维的分块张量展平，将多个块维合并为一维，并返回原块形状以便还原。
+
+  Flattens blocks of the input tensor.
 
   Args:
     x: a [batch, b1, ..., bn, items_in_block, depth] tensor
@@ -4179,7 +4413,9 @@ def flatten_blocks_nd(x):
 
 
 def unflatten_blocks_nd(x, blocks_per_dimension):
-  """Converts a flattened tensor into a normal blocked tensor.
+  """`flatten_blocks_nd` 的逆操作，将展平的块张量恢复为多维分块形式。
+
+  Converts a flattened tensor into a normal blocked tensor.
 
   Args:
     x: a [batch, d1 * ... dn, items_in_block, depth] tensor
@@ -4195,7 +4431,9 @@ def unflatten_blocks_nd(x, blocks_per_dimension):
 
 
 def break_into_memory_blocks_nd(x, query_shape, memory_flange, masked=False):
-  """Break a tensor into memory blocks around query blocks.
+  """将张量按记忆块进行分块，包括 query 块及周围的 memory_flange 块，用于 n 维局郠注意力。
+
+  Break a tensor into memory blocks around query blocks.
 
   This requires memory_flange to be divisible by query_shape in every dimension.
 
@@ -4248,7 +4486,9 @@ def break_into_memory_blocks_nd(x, query_shape, memory_flange, masked=False):
 
 
 def break_into_blocks_nd(x, block_shape):
-  """Break input tensor into blocks of `block_shape`.
+  """将 n 维张量按块大小分块，将块内元素展平到最后一个维度。
+
+  Break input tensor into blocks of `block_shape`.
 
   Args:
     x: a [batch, d1, d2, ..., dn, depth] tensor
@@ -4273,7 +4513,9 @@ def break_into_blocks_nd(x, block_shape):
 
 
 def put_back_blocks_nd(x, block_shape):
-  """Restructure input tensor from blocks to normal ordering.
+  """`break_into_blocks_nd` 的逆操作，将分块张量恢复为正常排列。
+
+  Restructure input tensor from blocks to normal ordering.
 
   Args:
     x: a [batch, b1, ..., bn, items_in_block, depth] tensor
@@ -4300,7 +4542,9 @@ def put_back_blocks_nd(x, block_shape):
 
 
 def pad_to_multiple_nd(x, block_shape):
-  """Making sure x is a multiple of shape.
+  """将 n 维张量填充至块大小的整数倍（每个维度就对应块大小的整数倍）。
+
+  Making sure x is a multiple of shape.
 
   Args:
     x: a [batch, d1, d2, ..., dn, depth] tensor
@@ -4315,7 +4559,9 @@ def pad_to_multiple_nd(x, block_shape):
 
 
 def causal_attention_bias_nd(query_shape, memory_flange, decode_step=None):
-  """Creates causal attention bias for local nd attention.
+  """为 n 维局郠注意力创建因果偏置，防止注意力看到未来位置。
+
+  Creates causal attention bias for local nd attention.
 
   This assumes memory_flange is divisible by query_shape in every dimension.
 
@@ -4374,7 +4620,9 @@ def compute_attention_component(antecedent,
                                 name="c",
                                 vars_3d_num_heads=0,
                                 layer_collection=None):
-  """Computes attention component (query, key or value).
+  """计算注意力分量（即 Q、K 或 V）：通过线性变换或卷积将输入序列映射到指定深度。
+
+  Computes attention component (query, key or value).
 
   Args:
     antecedent: a Tensor with shape [batch, length, channels]
@@ -4430,7 +4678,9 @@ def compute_qkv(query_antecedent,
                 kv_padding="VALID",
                 vars_3d_num_heads=0,
                 layer_collection=None):
-  """Computes query, key and value.
+  """同时计算注意力的 Q、K、V 三分量，直接三次调用 compute_attention_component 完成映射。
+
+  Computes query, key and value.
 
   Args:
     query_antecedent: a Tensor with shape [batch, length_q, channels]
@@ -4517,7 +4767,9 @@ def multihead_attention(query_antecedent,
                         area_value_mode="sum",
                         training=True,
                         **kwargs):
-  """Multihead scaled-dot-product attention with input/output transformations.
+  """多头缩放点积注意力完整实现：包含 Q/K/V 变换、分头、注意计算、合并头、输出变换，支持多种注意力类型和快速解码缓存。
+
+  Multihead scaled-dot-product attention with input/output transformations.
 
   Args:
     query_antecedent: a Tensor with shape [batch, length_q, channels]
@@ -4834,7 +5086,9 @@ def multihead_attention_2d(query_antecedent,
                            query_shape=(8, 16),
                            memory_flange=(8, 16),
                            name=None):
-  """2d Multihead scaled-dot-product attention with inp/output transformations.
+  """2D 多头缩放点积注意力，支持局部/掉果/TPU 友好型 2D 注意力（用于图像 Transformer）。
+
+  2d Multihead scaled-dot-product attention with inp/output transformations.
 
   Args:
     query_antecedent: a Tensor with shape [batch, h, w, depth_k]
@@ -4902,7 +5156,9 @@ def multihead_attention_nd(query_antecedent,
                            cache=None,
                            decode_step=None,
                            name=None):
-  """n-d Multihead scaled-dot-product attention with in/output transformations.
+  """n 维多头缩放点积注意力，支持局部掉果注意力和快速解码缓存（用于视频等多维序列）。
+
+  n-d Multihead scaled-dot-product attention with in/output transformations.
 
   Args:
     query_antecedent: a Tensor with shape [batch, d1, ..., dn, depth_q] or
@@ -4999,7 +5255,9 @@ def multihead_attention_nd(query_antecedent,
 
 
 def decode_step_to_index(decode_step, query_shape, tensor_shape):
-  """Maps decode step to n-d index according to blocked raster scan order.
+  """将解码步骤（标量）映射到 n 维块扫描顺序下的索引元组，用于 n 维掉果注意力的快速解码。
+
+  Maps decode step to n-d index according to blocked raster scan order.
 
   Args:
     decode_step: an integer
@@ -5034,7 +5292,9 @@ def decode_step_to_index(decode_step, query_shape, tensor_shape):
 
 
 def get_item_at_decode_step(x, decode_step, query_shape):
-  """Extracts a single item from an n-d tensor at `decode_step` position.
+  """按块扫描顺序从 n 维张量中提取解码步骤对应位置的单个元素（用于快速自回归解码）。
+
+  Extracts a single item from an n-d tensor at `decode_step` position.
 
   Args:
     x: a [batch, d1, d2, ..., dn, depth] tensor
@@ -5054,7 +5314,9 @@ def get_item_at_decode_step(x, decode_step, query_shape):
 
 
 def put_item_in_decode_step(x, item, decode_step, query_shape):
-  """Puts a single item into an n-d tensor at `decode_step` position.
+  """按块扫描顺序将单个元素写入 n 维张量的解码步骤对应位置（更新 KV 缓存中的键值）。
+
+  Puts a single item into an n-d tensor at `decode_step` position.
 
   Args:
     x: a [batch, heads, d1, d2, ..., dn, depth] tensor
@@ -5097,7 +5359,9 @@ def ffn_self_attention_layer(x,
                              dropout_rate,
                              share_kv=False,
                              name=None):
-  """Self-attention feedforward layer.
+  """用自注意力替代前馈网络的位置层，通过分组自注意计算表示分量间的乘性交互。
+
+  Self-attention feedforward layer.
 
   We use self-attention to do feedforward computations. We apply this function
   positionwise where for each position, we linearly transform the output to have
@@ -5163,7 +5427,9 @@ def parameter_attention(x,
                         num_heads,
                         dropout_rate,
                         name=None):
-  """Attention over parameters.
+  """对可学习参数张量（而非输入序列）作为第二记忆的注意力，键/值是模型参数。
+
+  Attention over parameters.
 
   We use the same multi-headed attention as in the other layers, but the memory
   keys and values are model parameters. There are no linear transformation on
@@ -5229,7 +5495,9 @@ def parameter_attention(x,
 
 @expert_utils.add_name_scope()
 def coordinate_tensor(shape, axis):
-  """Return a tensor with given shape containing coordinate along given axis.
+  """生成一个给定形状的张量，其中每个元素的値是其在指定轴上的坐标（索引）。
+
+  Return a tensor with given shape containing coordinate along given axis.
 
   Args:
     shape: a Tensor representing the shape of the output Tensor
@@ -5255,7 +5523,9 @@ def self_attention_expert(x,
                           attention_num_head=1,
                           attention_kq_size=None,
                           attention_v_size=None):
-  """Implementing attention that runs inside each expert.
+  """在每个专家（expert）内部执行多头自注意力（用于 MoE 混合专家注意力）。
+
+  Implementing attention that runs inside each expert.
 
   Args:
     x: A tensor of shape[batch, depth]. Contains representations from
@@ -5364,7 +5634,9 @@ def local_expert_attention(x,
                            train=True,
                            batch_coordinate=None,
                            **kwargs):
-  """Attention using a mixture of experts.
+  """基于混合专家（MoE）的注意力，将相同专家的 token 组在一起进行自注意。
+
+  Attention using a mixture of experts.
 
     Positions sent to the same expert can attend to each other.
     The mixture of experts is "local" in that it is replicated on each
@@ -5408,7 +5680,9 @@ def local_expert_attention(x,
 
 @expert_utils.add_name_scope()
 def expert_dot_product(q, k, v, info_q, info_k):
-  """Perform dot product on a subset of the sequence.
+  """在序列子集上执行点积注意力，根据批次坐标和时序和添加掉果掩码（用于稀疏专家注意力）。
+
+  Perform dot product on a subset of the sequence.
 
   Can add a mask to the attention to prevent sequences to attend to each other
   and to prevent attention to the future.
@@ -5473,7 +5747,9 @@ def expert_dot_product(q, k, v, info_q, info_k):
 
 @expert_utils.add_name_scope()
 def dot_product_single_head(q, k, v, gates_q, gates_k, bi):
-  """Perform a dot product attention on a single sequence on a single head.
+  """对单头单序列执行点积注意力，通过 LSH 门控分桛并对每个分桛内元素单独计算注意力。
+
+  Perform a dot product attention on a single sequence on a single head.
 
   This function dispatch the q, k, v and loop over the buckets to compute the
   attention dot product on each subsequences.
@@ -5534,7 +5810,9 @@ def dot_product_single_head(q, k, v, gates_q, gates_k, bi):
 
 
 def map_fn_switch(fn, elems, use_map_fn=True, **kwargs):
-  """Construct the graph with either tf.map_fn or a python for loop.
+  """切换使用 tf.map_fn 或 Python for 循环构建计算图（前者动态但慢，后者静态但快）。
+
+  Construct the graph with either tf.map_fn or a python for loop.
 
   This function is mainly for for benchmarking purpose.
 
@@ -5563,7 +5841,9 @@ def map_fn_switch(fn, elems, use_map_fn=True, **kwargs):
 
 @expert_utils.add_name_scope()
 def sparse_dot_product_attention(q, k, v, bi, use_map_fn, experts_params):
-  """Sparse multihead self attention.
+  """基于 LSH 分桛的稀疏多头自注意力，通过 key 分桛近似全量注意力，降低计算复杂度。
+
+  Sparse multihead self attention.
 
   Perform an approximation of the full multihead attention by dispatching
   the tokens using their keys/values. Thus the attention matrix are only
@@ -5660,7 +5940,9 @@ def sparse_dot_product_attention(q, k, v, bi, use_map_fn, experts_params):
 
 @expert_utils.add_name_scope()
 def dot_product_batched_head(q, k, v, gates_q, gates_k, mask_right=False):
-  """Perform a dot product attention on a single sequence on a single head.
+  """对单头批次序列执行分桛点积注意力，使用 TruncatingDispatcher 分配容量并计算各桶注意力。
+
+  Perform a dot product attention on a single sequence on a single head.
 
   This function dispatch the q, k, v and loop over the buckets to compute the
   attention dot product on each subsequences.
@@ -5740,7 +6022,9 @@ def sparse_dot_product_attention_truncated(
     use_map_fn=False,  # Unused
     mask_right=False,
 ):  # pylint: disable=unused-argument
-  """Sparse multihead self attention.
+  """按头分批处理的截断式稀疏注意力，使用 TruncatingDispatcher 分配容量并对各桶进行点积注意。
+
+  Sparse multihead self attention.
 
   Perform an approximation of the full multihead attention by dispatching
   the tokens using their keys/values. Thus the attention matrix are only
@@ -5839,7 +6123,9 @@ def sparse_dot_product_attention_truncated(
 
 @expert_utils.add_var_scope()
 def deconv_elems_1d(x, factor, out_depth=None):
-  """Increase the length and change the dimensionality.
+  """使用转置卷积扩大序列长度（每个位置扩展为 factor 个 token），用于序列长度扩张操作。
+
+  Increase the length and change the dimensionality.
 
   Expand/project each positions of dim depth of the input into
   factor*tokens of dim out_depth
@@ -5867,7 +6153,9 @@ def deconv_elems_1d(x, factor, out_depth=None):
 
 @expert_utils.add_var_scope()
 def conv_elems_1d(x, factor, out_depth=None):
-  """Decrease the length and change the dimensionality.
+  """使用步长卷积压缩序列长度（每 factor 个 token 压缩为 1 个），用于内存压缩接曻注意力。
+
+  Decrease the length and change the dimensionality.
 
   Merge/restore/compress factors positions of dim depth of the input into
   a single position of dim out_depth.
@@ -5899,7 +6187,9 @@ def conv_elems_1d(x, factor, out_depth=None):
 
 @expert_utils.add_var_scope()
 def local_reduction_attention(x, block_length, multihead_params):
-  """Reduce the length dimension using self attention.
+  """用块局部自注意力对序列长度维进行压缩，每个块内的所有元素压缩为一个输出。
+
+  Reduce the length dimension using self attention.
 
   Args:
     x (tf.Tensor): float32 of shape [batch, length, depth]
@@ -5991,7 +6281,9 @@ def multihead_self_attention_reduced(
     reduction_type="conv",
     add_mask=True,
 ):
-  """Reduce the length dimension by compressing with conv.
+  """用卷积压缩序列长度后再进行多头自注意力，降低长序列自注意的计算代价。
+
+  Reduce the length dimension by compressing with conv.
 
   Args:
     x (tf.Tensor): float32 of shape [batch, length, depth]
@@ -6076,7 +6368,9 @@ def multihead_self_attention_reduced(
 
 
 def scaled_dot_product_attention_simple(q, k, v, bias, name=None):
-  """Scaled dot-product attention. One head. One spatial dimension.
+  """单头单维缩放点积注意力的简单实现（不拆头，适合调试或简单场景）。
+
+  Scaled dot-product attention. One head. One spatial dimension.
 
   Args:
     q: a Tensor with shape [batch, length_q, depth_k]
@@ -6112,7 +6406,9 @@ def multihead_self_attention_memory_efficient(x,
                                               forget=True,
                                               test_vars=None,
                                               name=None):
-  """Multihead scaled-dot-product self-attention.
+  """内存高效多头自注意力，包含层归一化，进行反向传播时重计嵌入（forget=True 时不保存激活值）。
+
+  Multihead scaled-dot-product self-attention.
 
   Includes layer norm.
 

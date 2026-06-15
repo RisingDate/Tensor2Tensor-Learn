@@ -13,35 +13,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Layers common to multiple models."""
+"""多模型通用的神经网络层（Layers）实现。
+
+本文件是 Tensor2Tensor 框架的核心工具库，提供了构建深度学习模型所需的
+各种基础组件，包括：
+- 卷积（Conv）和全连接（Dense）层的封装
+- 归一化（Normalization）：层归一化、批归一化等
+- 激活函数：ReLU、GELU、SRU 等
+- Dropout 和正则化
+- 序列处理工具：padding、masking、位置编码
+- 损失函数：交叉熵、离散混合 logistic 损失
+- 内存高效的反向传播技术
+- GAN（生成对抗网络）相关工具
+- 集合（Set）处理层
+- 视频处理工具
+等等
+
+这些基础函数被 Transformer、ResNet、LSTM 等多种模型共享使用。
+"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import collections
-import contextlib
-import functools
-import math
+import collections  # Python 内置集合模块（OrderedDict、namedtuple等）
+import contextlib   # 上下文管理器工具
+import functools    # 高阶函数工具（如 partial、wraps）
+import math         # 数学函数
 
-from absl import logging
-import numpy as np
-from six.moves import range  # pylint: disable=redefined-builtin
+from absl import logging  # Google 的 abseil 日志库
+import numpy as np        # 数值计算库
+from six.moves import range  # Python 2/3 兼容的 range 函数 # pylint: disable=redefined-builtin
 
-from tensor2tensor.utils import contrib
-import tensorflow.compat.v1 as tf
-import tensorflow_probability as tfp
+from tensor2tensor.utils import contrib  # TF Contrib 模块的兼容封装
+import tensorflow.compat.v1 as tf        # TensorFlow 1.x 兼容 API
+import tensorflow_probability as tfp     # TensorFlow Probability（概率模型库）
 
-from tensorflow.python.framework import function
-from tensorflow.python.framework import ops
-from tensorflow.python.ops import control_flow_util
-from tensorflow.python.ops import inplace_ops
+from tensorflow.python.framework import function       # TF 自定义函数框架
+from tensorflow.python.framework import ops            # TF 操作基础框架
+from tensorflow.python.ops import control_flow_util    # 控制流工具（XLA 检测等）
+from tensorflow.python.ops import inplace_ops          # 原地操作工具
 
 
 # TODO(lukaszkaiser): remove this function when not needed any more.
 def layers():
-  """Get the layers module good for TF 1 and TF 2 work for now."""
+  """获取适配 TF 1.x 和 TF 2.x 的 layers 模块（临时兼容方案）。
+  
+  TensorFlow 在 2.x 版本中将 tf.layers 迁移到了 tf.keras.layers。
+  此函数通过检测 TF 版本来返回正确的 layers 模块，确保代码向前兼容。
+  
+  Returns:
+    layers_module: tf.layers（TF1）或 tf.keras.layers（TF2）
+  """
   layers_module = None
   try:
+    # 尝试获取 TF1 的 layers 模块
     layers_module = tf.layers
   except AttributeError:
     logging.info("Cannot access tf.layers, trying TF2 layers.")
@@ -49,80 +74,107 @@ def layers():
     from tensorflow.python import tf2  # pylint: disable=g-direct-tensorflow-import,g-import-not-at-top
     if tf2.enabled():
       logging.info("Running in V2 mode, using Keras layers.")
+      # TF2 模式下使用 Keras layers
       layers_module = tf.keras.layers
   except ImportError:
     pass
   return layers_module
 
 
+# @function.Defun 是一个装饰器，将 Python 函数注册为 TensorFlow 的自定义函数（op）
+# python_grad_func: 指定 Python 级别的梯度函数
+#   lambda x, dy: tf.convert_to_tensor(dy) 表示将梯度 dy 从 IndexedSlices 转换为稠密 Tensor
+# shape_func: 指定输出形状推导函数
+#   lambda op: [op.inputs[0].get_shape()] 表示输出形状与输入相同
 @function.Defun(
     python_grad_func=lambda x, dy: tf.convert_to_tensor(dy),
     shape_func=lambda op: [op.inputs[0].get_shape()])
 def convert_gradient_to_tensor(x):
-  """Identity operation whose gradient is converted to a `Tensor`.
+  """恒等操作，但将其梯度从稀疏格式（IndexedSlices）转换为稠密 Tensor。
 
-  Currently, the gradient to `tf.concat` is particularly expensive to
-  compute if dy is an `IndexedSlices` (a lack of GPU implementation
-  forces the gradient operation onto CPU).  This situation occurs when
-  the output of the `tf.concat` is eventually passed to `tf.gather`.
-  It is sometimes faster to convert the gradient to a `Tensor`, so as
-  to get the cheaper gradient for `tf.concat`.  To do this, replace
-  `tf.concat(x)` with `convert_gradient_to_tensor(tf.concat(x))`.
+  使用场景：
+  当 tf.concat 的输出最终被 tf.gather 使用时，梯度会是稀疏的 IndexedSlices。
+  TensorFlow 对稀疏梯度没有 GPU 实现，这会强制梯度计算在 CPU 上进行，导致性能下降。
+  
+  解决方案：将 tf.concat(x) 替换为 convert_gradient_to_tensor(tf.concat(x))，
+  这样反向传播时梯度会被转换为稠密 Tensor，从而使用更高效的 GPU 实现。
+  
+  注意：
+  - IndexedSlices 是稀疏张量的表示，只存储非零值及其索引
+  - 转换为稠密 Tensor 会增加内存使用，但减少 GPU/CPU 之间的数据传输
 
   Args:
-    x: A `Tensor`.
+    x: 输入张量（Tensor）
 
   Returns:
-    The input `Tensor`.
+    与输入完全相同的张量（但梯度流不同）
   """
   return x
 
 
 def is_xla_compiled():
-  """Whether we are building graph that will be compiled by XLA.
+  """检查当前计算图是否将被 XLA 编译器编译。
 
-  This checks whether the code is executing within an XLA context.
-
-  If True, model authors should ensure the graph they build is compilable by
-  XLA. Specifically, they should ensure that all ops have XLA implementations
-  and that all shapes are statically known.
+  XLA（Accelerated Linear Algebra）是 TensorFlow 的即时编译器，
+  可以将计算图编译为高效的机器代码，特别适合 TPU 加速。
+  
+  如果此函数返回 True，模型代码需要确保：
+  1. 所有使用的 op 都有 XLA 实现
+  2. 所有张量形状在编译时可以静态确定（不能有动态形状）
 
   Returns:
-    bool, whether the current graph will be compiled for XLA.
+    bool: 如果当前在 XLA 编译上下文中返回 True，否则返回 False
   """
+  # 获取当前计算图的控制流上下文
   ctxt = tf.get_default_graph()._get_control_flow_context()  # pylint: disable=protected-access
+  # 检查是否处于 XLA 上下文中
   return control_flow_util.GetContainingXLAContext(ctxt) is not None
 
 
 def to_float(x):
-  """Cast x to float; created because tf.to_float is deprecated."""
+  """将张量转换为 float32 类型（替代已弃用的 tf.to_float）。
+  
+  Args:
+    x: 任意类型的张量（通常是 int32 或 bool）
+    
+  Returns:
+    float32 类型的张量
+  """
   return tf.cast(x, tf.float32)
 
 
 def dropout_with_broadcast_dims(x, keep_prob, broadcast_dims=None, **kwargs):
-  """Like tf.nn.dropout but takes broadcast_dims instead of noise_shape.
+  """与 tf.nn.dropout 相同，但使用 broadcast_dims 参数代替 noise_shape。
 
-  Instead of specifying noise_shape, this function takes broadcast_dims -
-  a list of dimension numbers in which noise_shape should be 1.  The random
-  keep/drop tensor has dimensionality 1 along these dimensions.
+  标准 tf.nn.dropout 使用 noise_shape 来指定随机 mask 的形状。
+  此函数改用 broadcast_dims（广播维度列表），更直观：
+  指定在哪些维度上共享同一个 dropout mask（该维度的 noise_shape=1）。
+  
+  使用场景：
+  - 设置 broadcast_dims=[0] 表示在 batch 维度上共享 dropout mask，
+    同一批次内的所有样本使用相同的 mask（节省内存）
+  - 设置 broadcast_dims=[1] 表示在序列长度维度上共享 mask，
+    相当于对整个序列的某些特征维度一起丢弃
+  
+  这对于 Transformer 的层预处理/后处理中使用的 dropout 特别有用。
 
   Args:
-    x: a floating point tensor.
-    keep_prob: A scalar Tensor with the same type as x.
-      The probability that each element is kept.
-    broadcast_dims: an optional list of integers
-      the dimensions along which to broadcast the keep/drop flags.
-    **kwargs: keyword arguments to tf.nn.dropout other than "noise_shape".
+    x: 浮点型张量，被 dropout 的输入
+    keep_prob: 标量张量，每个元素被保留的概率（例如 0.9 表示 10% dropout）
+    broadcast_dims: 可选的整数列表，指定在哪些维度上广播 dropout mask
+                   （这些维度的 noise_shape=1），支持负索引
+    **kwargs: 其他传递给 tf.nn.dropout 的关键字参数（不含 noise_shape）
 
   Returns:
-    Tensor of the same shape as x.
+    与 x 形状相同的张量，dropout 后的结果
   """
-  assert "noise_shape" not in kwargs
+  assert "noise_shape" not in kwargs  # 不允许同时指定 noise_shape
   if broadcast_dims:
-    shape = tf.shape(x)
-    ndims = len(x.get_shape())
-    # Allow dimensions like "-1" as well.
+    shape = tf.shape(x)  # 获取动态形状
+    ndims = len(x.get_shape())  # 获取静态维度数
+    # 支持负索引（如 -1 表示最后一维）
     broadcast_dims = [dim + ndims if dim < 0 else dim for dim in broadcast_dims]
+    # 构建 noise_shape：广播维度的大小设为 1，其他维度保持原大小
     kwargs["noise_shape"] = [
         1 if i in broadcast_dims else shape[i] for i in range(ndims)
     ]
@@ -130,51 +182,150 @@ def dropout_with_broadcast_dims(x, keep_prob, broadcast_dims=None, **kwargs):
 
 
 def comma_separated_string_to_integer_list(s):
+  """将逗号分隔的字符串转换为整数列表。
+  
+  例如："1,2,3" -> [1, 2, 3]，"" -> []
+  
+  Args:
+    s: 逗号分隔的整数字符串
+    
+  Returns:
+    整数列表
+  """
   return [int(i) for i in s.split(",") if i]
 
 
 def saturating_sigmoid(x):
-  """Saturating sigmoid: 1.2 * sigmoid(x) - 0.1 cut to [0, 1]."""
+  """饱和 sigmoid 函数：1.2 * sigmoid(x) - 0.1，结果截断到 [0, 1]。
+  
+  这是标准 sigmoid 的改进版本，通过拉伸曲线使其在接近 0 和 1 时更"硬"
+  （更快达到饱和状态），同时在中间区域（0.1 到 0.9 之间）
+  比普通 sigmoid 有更好的梯度传播。
+  
+  原理：
+  - 普通 sigmoid 在输出 0 和 1 附近梯度趋近于 0（梯度消失）
+  - 饱和 sigmoid 通过缩放让更多输入区间对应 0 和 1 的输出，
+    但在中间区域仍保持较大梯度
+  """
   with tf.name_scope("saturating_sigmoid", values=[x]):
     y = tf.sigmoid(x)
+    # 拉伸并截断：将 sigmoid 的 [0,1] 输出映射到稍宽的范围，再截断
     return tf.minimum(1.0, tf.maximum(0.0, 1.2 * y - 0.1))
 
 
 def hard_sigmoid(x, saturation_limit=0.9):
+  """硬 sigmoid 函数，带饱和惩罚项。
+  
+  硬 sigmoid 是 sigmoid 的分段线性近似，计算效率更高。
+  同时计算饱和惩罚：当 |x| > saturation_limit 时增加惩罚，
+  防止激活值过大导致饱和。
+  
+  Args:
+    x: 输入张量
+    saturation_limit: 饱和阈值，超过此绝对值时增加惩罚
+    
+  Returns:
+    (output, saturation_cost): 函数输出值和饱和惩罚损失
+  """
+  # 计算饱和惩罚：超出 saturation_limit 的部分取均值作为额外损失
   saturation_cost = tf.reduce_mean(tf.nn.relu(tf.abs(x) - saturation_limit))
+  # 将 x 从 [-1,1] 线性映射到 [0,1]，然后用 ReLU 截断负值，minimum 截断大于1的值
   x_shifted = 0.5 * x + 0.5
   return tf.minimum(1.0, tf.nn.relu(x_shifted)), saturation_cost
 
 
 def hard_tanh(x, saturation_limit=0.9):
+  """硬 tanh 函数，带饱和惩罚项。
+  
+  硬 tanh 将输出截断到 [-1, 1]，同时对过大的输入值施加惩罚。
+  
+  Args:
+    x: 输入张量
+    saturation_limit: 饱和阈值
+    
+  Returns:
+    (output, saturation_cost): 截断到 [-1,1] 的输出和饱和惩罚损失
+  """
   saturation_cost = tf.reduce_mean(tf.nn.relu(tf.abs(x) - saturation_limit))
   return tf.minimum(1.0, tf.maximum(x, -1.0)), saturation_cost
 
 
 def inverse_exp_decay(max_step, min_value=0.01, step=None):
-  """Inverse-decay exponentially from min_value to 1.0 reached at max_step."""
+  """逆指数衰减：从 min_value 指数增长到 1.0，在 max_step 步时达到 1.0。
+  
+  这是一种"反向"衰减曲线，通常用于学习率预热（warmup）：
+  - 在训练开始（step=0）时，值为 min_value（如 0.01）
+  - 随着训练步数增加，值指数增长
+  - 在 step=max_step 时，值恰好达到 1.0
+  
+  数学公式：y = base^(max_step - step)
+  其中 base = exp(log(min_value) / max_step) = min_value^(1/max_step)
+  
+  Args:
+    max_step: 值增长到 1.0 时的训练步数
+    min_value: 起始值（step=0 时的值）
+    step: 当前训练步数，None 时从全局步数获取
+    
+  Returns:
+    当前步数对应的值（在 [min_value, 1.0] 范围内）
+  """
+  # 计算基数：base^max_step = min_value => base = min_value^(1/max_step)
   inv_base = tf.exp(tf.log(min_value) / float(max_step))
   if step is None:
     step = tf.train.get_global_step()
   if step is None:
-    return 1.0
+    return 1.0  # 无法获取步数时，直接返回 1.0
   step = to_float(step)
+  # 当 step >= max_step 时，指数为 0，返回 base^0 = 1.0
   return inv_base**tf.maximum(float(max_step) - step, 0.0)
 
 
 def inverse_lin_decay(max_step, min_value=0.01, step=None):
-  """Inverse-decay linearly from min_value to 1.0 reached at max_step."""
+  """逆线性衰减：从 min_value 线性增长到 1.0，在 max_step 步时达到 1.0。
+  
+  与 inverse_exp_decay 类似，但增长曲线是线性的（直线）。
+  常用于计划采样（scheduled sampling）的概率预热。
+  
+  数学公式：y = progress * (1 - min_value) + min_value
+  其中 progress = min(step / max_step, 1.0)
+  
+  Args:
+    max_step: 值增长到 1.0 时的步数
+    min_value: 起始值
+    step: 当前训练步数
+    
+  Returns:
+    当前步数对应的值（在 [min_value, 1.0] 范围内）
+  """
   if step is None:
     step = tf.train.get_global_step()
   if step is None:
     return 1.0
   step = to_float(step)
+  # progress: 训练进度，从 0 到 1（max_step 后保持 1.0）
   progress = tf.minimum(step / float(max_step), 1.0)
+  # 线性插值：从 min_value 到 1.0
   return progress * (1.0 - min_value) + min_value
 
 
 def inverse_sigmoid_decay(max_step, min_value=0.01, step=None):
-  """Inverse-decay linearly from min_value to 1.0 reached at max_step."""
+  """逆 sigmoid 衰减：从 min_value 以 S 形曲线增长到 1.0，在 max_step 步时达到约 1.0。
+  
+  S 形增长曲线的特点：
+  - 初期增长缓慢（平稳起步）
+  - 中期快速增长（加速阶段）
+  - 后期再次减缓（平稳收尾）
+  
+  这比线性预热更自然，适合某些需要平滑过渡的场景。
+  
+  Args:
+    max_step: 值接近 1.0 时的步数
+    min_value: 起始值（必须 > 0 且 < 0.5）
+    step: 当前训练步数
+    
+  Returns:
+    当前步数对应的值（在 [min_value, 1.0] 范围内）
+  """
   if step is None:
     step = tf.train.get_global_step()
   if step is None:
@@ -182,9 +333,11 @@ def inverse_sigmoid_decay(max_step, min_value=0.01, step=None):
   step = to_float(step)
 
   def sigmoid(x):
+    """标准 sigmoid 函数：1 / (1 + e^(-x))"""
     return 1 / (1 + tf.exp(-x))
 
   def inv_sigmoid(y):
+    """sigmoid 的逆函数（logit 函数）：log(y / (1-y))"""
     return tf.log(y / (1 - y))
 
   assert min_value > 0, (
@@ -192,27 +345,41 @@ def inverse_sigmoid_decay(max_step, min_value=0.01, step=None):
       "these bounds for interpolation to work.")
   assert min_value < 0.5, "Must choose min_value on the left half of sigmoid."
 
-  # Find
-  #   x  s.t. sigmoid(x ) = y_min and
-  #   x' s.t. sigmoid(x') = y_max
-  # We will map [0, max_step] to [x_min, x_max].
+  # 找到使 sigmoid(x_min) = y_min 和 sigmoid(x_max) = y_max 的 x 值
+  # 将训练步数 [0, max_step] 映射到 sigmoid 的 [x_min, x_max]
   y_min = min_value
   y_max = 1.0 - min_value
-  x_min = inv_sigmoid(y_min)
-  x_max = inv_sigmoid(y_max)
+  x_min = inv_sigmoid(y_min)  # sigmoid 输入的最小值（对应 y_min）
+  x_max = inv_sigmoid(y_max)  # sigmoid 输入的最大值（对应 y_max）
 
-  x = tf.minimum(step / float(max_step), 1.0)  # [0, 1]
-  x = x_min + (x_max - x_min) * x  # [x_min, x_max]
-  y = sigmoid(x)  # [y_min, y_max]
+  x = tf.minimum(step / float(max_step), 1.0)  # 将步数归一化到 [0, 1]
+  x = x_min + (x_max - x_min) * x  # 线性映射到 [x_min, x_max]
+  y = sigmoid(x)  # 通过 sigmoid 得到 [y_min, y_max]
 
-  y = (y - y_min) / (y_max - y_min)  # [0, 1]
-  y = y * (1.0 - y_min)  # [0, 1-y_min]
-  y += y_min  # [y_min, 1]
+  # 将 [y_min, y_max] 重新归一化并缩放到 [y_min, 1.0]
+  y = (y - y_min) / (y_max - y_min)  # 归一化到 [0, 1]
+  y = y * (1.0 - y_min)  # 缩放到 [0, 1-y_min]
+  y += y_min  # 平移到 [y_min, 1]
   return y
 
 
 def shakeshake2_py(x, y, equal=False, individual=False):
-  """The shake-shake sum of 2 tensors, python version."""
+  """Shake-Shake 正则化：对两个张量的随机加权求和（Python 版本）。
+  
+  Shake-Shake（论文 "Shake-Shake regularization"）是一种针对多分支神经网络的正则化方法：
+  - 前向传播时，用随机权重 alpha 和 1-alpha 混合两个分支的输出
+  - 反向传播时，用另一组独立随机权重
+  这种不一致性迫使每个分支独立学习，类似于 Dropout 的集成效果。
+  
+  Args:
+    x: 第一个张量
+    y: 第二个张量（形状与 x 相同）
+    equal: 如果 True，使用固定权重 alpha=0.5（均等混合，用于推理/测试阶段）
+    individual: 如果 True，为 batch 中的每个样本独立采样一个 alpha
+    
+  Returns:
+    alpha * x + (1 - alpha) * y，其中 alpha 根据参数策略决定
+  """
   if equal:
     alpha = 0.5
   elif individual:
@@ -225,7 +392,11 @@ def shakeshake2_py(x, y, equal=False, individual=False):
 
 @function.Defun()
 def shakeshake2_grad(x1, x2, dy):
-  """Overriding gradient for shake-shake of 2 tensors."""
+  """覆盖 shakeshake2 的梯度计算（反向传播时使用不同的随机 alpha）。
+  
+  前向传播用一个随机 alpha，反向传播用另一个随机 alpha，
+  这种不一致性是 Shake-Shake 正则化的关键。
+  """
   y = shakeshake2_py(x1, x2)
   dx = tf.gradients(ys=[y], xs=[x1, x2], grad_ys=[dy])
   return dx
@@ -233,7 +404,7 @@ def shakeshake2_grad(x1, x2, dy):
 
 @function.Defun()
 def shakeshake2_indiv_grad(x1, x2, dy):
-  """Overriding gradient for shake-shake of 2 tensors."""
+  """shakeshake2_indiv 的梯度：每个样本独立采样随机 alpha。"""
   y = shakeshake2_py(x1, x2, individual=True)
   dx = tf.gradients(ys=[y], xs=[x1, x2], grad_ys=[dy])
   return dx
@@ -241,7 +412,7 @@ def shakeshake2_indiv_grad(x1, x2, dy):
 
 @function.Defun()
 def shakeshake2_equal_grad(x1, x2, dy):
-  """Overriding gradient for shake-shake of 2 tensors."""
+  """shakeshake2_eqgrad 的梯度：前向和反向均使用 alpha=0.5（均等梯度版本）。"""
   y = shakeshake2_py(x1, x2, equal=True)
   dx = tf.gradients(ys=[y], xs=[x1, x2], grad_ys=[dy])
   return dx
@@ -249,23 +420,40 @@ def shakeshake2_equal_grad(x1, x2, dy):
 
 @function.Defun(grad_func=shakeshake2_grad)
 def shakeshake2(x1, x2):
-  """The shake-shake function with a different alpha for forward/backward."""
+  """标准 Shake-Shake：前向和反向使用不同的随机权重 alpha。
+  
+  前向：随机 alpha（全局标量，所有样本共享）
+  反向：另一个随机 alpha（由 shakeshake2_grad 实现）
+  """
   return shakeshake2_py(x1, x2)
 
 
 @function.Defun(grad_func=shakeshake2_indiv_grad)
 def shakeshake2_indiv(x1, x2):
+  """Individual Shake-Shake：每个样本使用独立的随机权重 alpha。"""
   return shakeshake2_py(x1, x2, individual=True)
 
 
 @function.Defun(grad_func=shakeshake2_equal_grad)
 def shakeshake2_eqgrad(x1, x2):
-  """The shake-shake function with a different alpha for forward/backward."""
+  """Equal-grad Shake-Shake：前向用随机 alpha，反向用均等 alpha=0.5。"""
   return shakeshake2_py(x1, x2)
 
 
 def shakeshake(xs, equal_grad=False):
-  """Multi-argument shake-shake, currently approximated by sums of 2."""
+  """多分支 Shake-Shake 正则化（目前通过两两配对来近似）。
+  
+  递归地将多个张量两两进行 shake-shake 融合：
+  - 将列表分成两半，分别递归融合
+  - 再对结果进行一次 shake-shake
+  
+  Args:
+    xs: 张量列表（多个网络分支的输出）
+    equal_grad: 是否使用均等梯度（equal_grad=True 用于测试/推理）
+    
+  Returns:
+    所有分支融合后的张量
+  """
   if len(xs) == 1:
     return xs[0]
   div = (len(xs) + 1) // 2
@@ -277,7 +465,10 @@ def shakeshake(xs, equal_grad=False):
 
 
 def convert_rgb_to_real(x):
-  """Conversion of pixel values to real numbers."""
+  """将 RGB 像素值（0-255 整数）转换为 [0, 1] 范围的浮点数。
+  
+  用于图像预处理：将 uint8 格式的像素值归一化到 [0, 1]。
+  """
   with tf.name_scope("rgb_to_real", values=[x]):
     x = to_float(x)
     x /= 255.0
@@ -285,7 +476,11 @@ def convert_rgb_to_real(x):
 
 
 def convert_rgb_to_symmetric_real(x):
-  """Conversion of pixel values to real numbers."""
+  """将 RGB 像素值（0-255 整数）转换为 [-1, 1] 范围的浮点数。
+  
+  用于 GAN 等模型的图像预处理：将像素值对称归一化到 [-1, 1]。
+  公式：(x / 127.5) - 1
+  """
   with tf.name_scope("rgb_to_real", values=[x]):
     x = to_float(x)
     # Convert each pixel intensity in [0, 1, 2, ..., 255] into a real number in
@@ -295,14 +490,30 @@ def convert_rgb_to_symmetric_real(x):
 
 
 def convert_real_to_rgb(x):
-  """Conversion of real numbers to pixel values."""
+  """将 [0, 1] 范围的浮点数转换回 RGB 像素值（乘以 255）。
+  
+  与 convert_rgb_to_real 的逆操作，用于生成图像的后处理。
+  """
   with tf.name_scope("real_to_rgb", values=[x]):
     x *= 255.0
     return x
 
 
 def expand_squeeze_to_nd(x, n, squeeze_dim=2, expand_dim=-1):
-  """Make x n-d with squeeze and expand_dims."""
+  """通过 squeeze 和 expand_dims 将张量调整为 n 维。
+  
+  如果当前维度 > n，则在 squeeze_dim 维度上压缩（去掉大小为 1 的维度）；
+  如果当前维度 < n，则在 expand_dim 维度上扩展（增加大小为 1 的维度）。
+  
+  Args:
+    x: 输入张量
+    n: 目标维度数
+    squeeze_dim: 要压缩的维度（当维度过多时）
+    expand_dim: 要扩展的维度（当维度不足时）
+    
+  Returns:
+    n 维张量
+  """
   if len(x.shape) > n:
     while len(x.shape) != n:
       x = tf.squeeze(x, [squeeze_dim])
@@ -313,7 +524,14 @@ def expand_squeeze_to_nd(x, n, squeeze_dim=2, expand_dim=-1):
 
 
 def standardize_images(x):
-  """Image standardization on batches and videos."""
+  """对批量图像或视频进行标准化处理（零均值、单位方差）。
+  
+  对每张图像独立地减去均值并除以标准差，使像素值中心化且方差为 1。
+  这是图像分类任务中常见的预处理步骤，有助于加速训练收敛。
+  
+  公式：(x - mean(x)) / max(std(x), 1/sqrt(num_pixels))
+  分母取最大值是为了防止除以接近零的标准差。
+  """
   with tf.name_scope("standardize_images", values=[x]):
     x_shape = shape_list(x)
     x = to_float(tf.reshape(x, [-1] + x_shape[-3:]))
@@ -326,7 +544,11 @@ def standardize_images(x):
 
 
 def flatten4d3d(x):
-  """Flatten a 4d-tensor into a 3d-tensor by joining width and height."""
+  """将 4D 张量 [batch, height, width, depth] 展平为 3D 张量 [batch, height*width, depth]。
+  
+  用于将 2D 空间特征图（图像特征）转换为 1D 序列形式，
+  以便输入到序列模型（如 Transformer）中。
+  """
   xshape = shape_list(x)
   result = tf.reshape(x, [xshape[0], xshape[1] * xshape[2], xshape[3]])
   return result
@@ -334,43 +556,75 @@ def flatten4d3d(x):
 
 # TODO(noam): remove this function after TPUs do gather faster.
 def gather(params, indices, dtype=tf.float32):
-  """Version of tf.gather that works faster on tpu."""
+  """gather 操作的 TPU 优化版本，在 TPU 上比 tf.gather 更快。
+  
+  在 CPU/GPU 上直接使用 tf.gather（标准实现）。
+  在 TPU 上，tf.gather 较慢，改用 one-hot 编码乘以参数矩阵的方式实现：
+    result = one_hot(indices) @ params
+  这种方式可以利用 TPU 优化的矩阵乘法。
+  
+  Args:
+    params: 参数矩阵（如 embedding 矩阵），形状 [vocab_size, embed_dim]
+    indices: 整数索引张量，形状任意
+    dtype: 输出数据类型
+    
+  Returns:
+    从 params 中按 indices 查找到的结果
+  """
   if not is_xla_compiled():
+    # 非 XLA/TPU 环境：直接使用标准 tf.gather
     return tf.gather(params, indices)
+  # TPU 优化实现：通过 one-hot 向量与参数矩阵的矩阵乘法来模拟 gather
   vocab_size = params.get_shape().as_list()[0]
-  indices_flat = tf.reshape(indices, [-1])
+  indices_flat = tf.reshape(indices, [-1])  # 将索引展平为 1D
+  # one_hot(indices_flat, vocab_size) @ params 等价于按索引查找
   out = tf.matmul(tf.one_hot(indices_flat, vocab_size, dtype=dtype), params)
+  # 将结果重新 reshape 成与 indices 对应的形状（最后加一维）
   out = reshape_like(out, tf.expand_dims(indices, -1))
   return out
 
 
 # TODO(noam): remove this function after TPUs do cumsum faster.
 def cumsum(x, axis=0, exclusive=False):
-  """TPU hack for tf.cumsum.
-
-  This is equivalent to tf.cumsum and is faster on TPU as of 04/2018 unless
-  the axis dimension is very large.
-
+  """累积求和的 TPU 优化版本。
+  
+  在 CPU/GPU 上等价于 tf.cumsum。
+  在 TPU 上（截至 2018 年 4 月），通过三角矩阵掩码实现的矩阵乘法比原生 tf.cumsum 更快
+  （当轴维度不太大时）。
+  
+  原理：
+  - 构建一个下三角矩阵 mask（mask[i][j] = 1 if j <= i else 0）
+  - 通过 tensordot 实现 cumsum：ret[..., i, ...] = sum(x[..., j, ...] for j <= i)
+  
+  exclusive=True 时计算不包含当前元素的前缀和（exclusive cumsum），即：
+    ret[i] = sum(x[j] for j < i)
+  
   Args:
-    x: a Tensor
-    axis: an integer
-    exclusive: a boolean
-
+    x: 输入张量
+    axis: 进行累积求和的轴
+    exclusive: 是否计算独占前缀和（不含当前元素）
+    
   Returns:
-    Tensor of the same shape as x.
+    与 x 形状相同的累积求和结果
   """
   if not is_xla_compiled():
+    # 非 TPU 环境：直接使用标准 tf.cumsum
     return tf.cumsum(x, axis=axis, exclusive=exclusive)
+  # TPU 优化实现：通过掩码矩阵乘法实现
   x_shape = shape_list(x)
   rank = len(x_shape)
   length = x_shape[axis]
-  my_range = tf.range(length)
+  my_range = tf.range(length)  # [0, 1, 2, ..., length-1]
+  # exclusive=True 时使用 <（不含当前），False 时使用 <=（含当前）
   comparator = tf.less if exclusive else tf.less_equal
+  # 构建下三角（或严格下三角）掩码矩阵
   mask = tf.cast(
       comparator(tf.expand_dims(my_range, 1), tf.expand_dims(my_range, 0)),
       x.dtype)
+  # 通过 tensordot 实现矩阵乘法：沿 axis 维度进行累积求和
   ret = tf.tensordot(x, mask, axes=[[axis], [0]])
   if axis != rank - 1:
+    # 如果 axis 不是最后一维，需要转置回原来的维度顺序
     ret = tf.transpose(
         ret,
         list(range(axis)) + [rank - 1] + list(range(axis, rank - 1)))
@@ -378,18 +632,25 @@ def cumsum(x, axis=0, exclusive=False):
 
 
 def dropout_no_scaling(x, keep_prob):
-  """Like tf.nn.dropout, but does not scale up.  Works on integers also.
-
+  """不带缩放的 Dropout，也适用于整型张量。
+  
+  标准 tf.nn.dropout 在丢弃元素后会将剩余元素乘以 1/keep_prob（期望缩放），
+  这样可以保持期望值不变。但此函数不做缩放，直接将被丢弃的位置置零。
+  
+  用途：用于 token-level dropout（符号 dropout），直接将 token 置零而不需要缩放。
+  
   Args:
-    x: a Tensor
-    keep_prob: a floating point number
-
+    x: 输入张量（整型或浮点型均可）
+    keep_prob: 每个元素被保留的概率（1.0 表示不丢弃）
+    
   Returns:
-    Tensor of the same shape as x.
+    与 x 形状相同的张量，某些位置被置零（不缩放）
   """
   if keep_prob == 1.0:
-    return x
+    return x  # keep_prob=1 时不做任何处理，直接返回
+  # 生成随机掩码：keep_prob 概率为 True（保留），1-keep_prob 概率为 False（丢弃）
   mask = tf.less(tf.random_uniform(tf.shape(x)), keep_prob)
+  # 将掩码转换成与 x 相同的类型，并与 x 相乘（False=0 相当于丢弃）
   return x * cast_like(mask, x)
 
 
@@ -402,39 +663,98 @@ def embedding(x,
               symbol_dropout_rate=0.0,
               embedding_var=None,
               dtype=tf.float32):
-  """Embed x of type int64 into dense vectors, reducing to max 4 dimensions."""
+  """将整数 token ID 查找并嵌入为稠密向量（词嵌入）。
+  
+  这是 Transformer 的第一个操作：将每个 token（整数 ID）
+  转换为固定维度的稠密向量（embedding）。
+  
+  实现细节：
+  1. 创建 embedding 矩阵（vocab_size × dense_size）
+  2. 将梯度转为稠密 Tensor（优化参数服务器通信）
+  3. 可选地对 token 进行 dropout（随机将某些 token 置零）
+  4. 通过 gather 查找 embedding
+  5. 可选地乘以缩放因子（Transformer 用 sqrt(hidden_size) 缩放）
+  
+  Args:
+    x: 整数类型的输入张量，存储 token ID，形状 [batch, length]
+    vocab_size: 词表大小（embedding 矩阵的行数）
+    dense_size: 嵌入向量维度（d_model，embedding 矩阵的列数）
+    name: 变量作用域名称
+    reuse: 是否重用已有变量（参数共享时使用）
+    multiplier: embedding 向量的缩放系数（Transformer 中为 sqrt(d_model)）
+    symbol_dropout_rate: token 级 dropout 概率（在 embedding 前将部分 token 置零）
+    embedding_var: 可选的预定义 embedding 矩阵变量
+    dtype: 输出数据类型
+    
+  Returns:
+    稠密 embedding 向量，形状 [batch, length, dense_size]
+  """
   with tf.variable_scope(
       name, default_name="embedding", values=[x], reuse=reuse, dtype=dtype):
     if embedding_var is None:
+      # 创建 embedding 矩阵：[vocab_size, dense_size]
       embedding_var = tf.get_variable("kernel", [vocab_size, dense_size])
-    # On the backwards pass, we want to convert the gradient from
-    # an indexed-slices to a regular tensor before sending it back to the
-    # parameter server. This avoids excess computation on the parameter server.
+    # 在反向传播中，将梯度从稀疏 IndexedSlices 转为稠密 Tensor，
+    # 以减少参数服务器上的计算量
     if not tf.executing_eagerly():
       embedding_var = convert_gradient_to_tensor(embedding_var)
+    # 对 token 进行 dropout（在 embedding 查找之前随机置零某些 token）
     x = dropout_no_scaling(x, 1.0 - symbol_dropout_rate)
+    # 通过 gather 查找每个 token 对应的 embedding 向量
     emb_x = gather(embedding_var, x, dtype)
     if multiplier != 1.0:
+      # 乘以缩放因子（Transformer 标准：乘以 sqrt(d_model) 来与位置编码量级匹配）
       emb_x *= multiplier
     static_shape = emb_x.shape.as_list()
     if len(static_shape) < 5:
       return emb_x
     assert len(static_shape) == 5
-    # If we had an extra channel dimension, assume it's 1, i.e. shape[3] == 1.
+    # 如果有额外的 channel 维度（通常为 1），将其压缩掉
     return tf.squeeze(emb_x, 3)
 
 
 def shift_right(x, pad_value=None):
-  """Shift the second dimension of x right by one."""
+  """将 4D 张量在序列维度（第二维）上向右移动一位（Teacher Forcing 的核心操作）。
+  
+  这是 Transformer 解码器训练时的关键操作，用于实现 Teacher Forcing：
+  在训练时，解码器的输入是真实目标序列向右移一位的结果，
+  相当于在每个位置上，模型看到的是"前一个真实 token"，然后预测"当前 token"。
+  
+  例如，目标序列为 [A, B, C, D]，向右移位后变为 [PAD, A, B, C]。
+  解码器在位置 0 看到 PAD，预测 A；在位置 1 看到 A，预测 B；以此类推。
+  
+  注意：这种训练方式与推理时不同。推理时，解码器使用自己生成的上一个 token
+  作为下一步的输入（而不是真实 token），这种训练推理不一致称为 "Exposure Bias"。
+  
+  Args:
+    x: 4D 张量，形状 [batch, length, height, depth]
+    pad_value: 填充值张量（填在左端），None 时用 0 填充
+    
+  Returns:
+    向右移位后的张量，形状与 x 相同
+  """
   if pad_value is None:
+    # 在左侧填充一个零（左侧加一行），然后截掉最后一个位置
     shifted_targets = tf.pad(x, [[0, 0], [1, 0], [0, 0], [0, 0]])[:, :-1, :, :]
   else:
+    # 在左侧拼接 pad_value，然后截掉最后一个位置
     shifted_targets = tf.concat([pad_value, x], axis=1)[:, :-1, :, :]
   return shifted_targets
 
 
 def shift_right_3d(x, pad_value=None):
-  """Shift the second dimension of x right by one."""
+  """将 3D 张量在序列维度（第二维）上向右移动一位。
+  
+  与 shift_right 相同，但适用于 3D 张量 [batch, length, depth]。
+  这是 Transformer 解码器的标准输入预处理操作。
+  
+  Args:
+    x: 3D 张量，形状 [batch, length, depth]
+    pad_value: 填充值张量，None 时用 0 填充
+    
+  Returns:
+    向右移位后的 3D 张量
+  """
   if pad_value is None:
     shifted_targets = tf.pad(x, [[0, 0], [1, 0], [0, 0]])[:, :-1, :]
   else:
@@ -443,7 +763,17 @@ def shift_right_3d(x, pad_value=None):
 
 
 def shift_right_2d(x, pad_value=None):
-  """Shift the second dimension of x right by one."""
+  """将 2D 张量在序列维度（第二维）上向右移动一位。
+  
+  与 shift_right 相同，但适用于 2D 张量 [batch, length]（如 token ID 序列）。
+  
+  Args:
+    x: 2D 张量，形状 [batch, length]
+    pad_value: 填充值张量，None 时用 0 填充
+    
+  Returns:
+    向右移位后的 2D 张量
+  """
   if pad_value is None:
     shifted_targets = tf.pad(x, [[0, 0], [1, 0]])[:, :-1]
   else:
@@ -452,23 +782,26 @@ def shift_right_2d(x, pad_value=None):
 
 
 def conv_stride2_multistep(x, nbr_steps, output_filters, name=None, reuse=None):
-  """Use a strided convolution to downsample x by 2, `nbr_steps` times.
+  """使用步幅卷积将 x 进行 nbr_steps 次下采样，每次缩小 2 倍。
 
-  We use stride and filter size 2 to avoid the checkerboard problem of deconvs.
-  As detailed in http://distill.pub/2016/deconv-checkerboard/.
+  使用步幅（stride=2）和卷积核大小为 2 的卷积，以避免反卷积的棋盘格（checkerboard）问题。
+  详见：http://distill.pub/2016/deconv-checkerboard/
+  
+  棋盘格问题：使用转置卷积（deconv）上采样时，由于卷积核的不均匀重叠，
+  生成的图像中会出现棋盘格状的伪影。用步幅卷积做下采样可以避免这个问题。
 
   Args:
-    x: a `Tensor` with shape `[batch, spatial, depth]` or
-     `[batch, spatial_1, spatial_2, depth]`
-    nbr_steps: number of halving downsample rounds to apply
-    output_filters: an int specifying the filter count for the convolutions
-    name: a string
-    reuse: a boolean
+    x: 输入张量，形状 [batch, spatial, depth] 或
+     [batch, spatial_1, spatial_2, depth]
+    nbr_steps: 下采样次数，最终空间维度缩小 2**nbr_steps 倍
+    output_filters: 卷积输出通道数
+    name: 变量作用域名称
+    reuse: 是否重用变量
 
   Returns:
-    a `Tensor` with shape `[batch, spatial / (2**nbr_steps), output_filters]` or
-     `[batch, spatial_1 / (2**nbr_steps), spatial_2 / (2**nbr_steps),
-       output_filters]`
+    (最终特征图, 所有中间特征图的列表)
+    最终特征图形状：[batch, spatial / (2**nbr_steps), output_filters] 或
+     [batch, spatial_1 / (2**nbr_steps), spatial_2 / (2**nbr_steps), output_filters]
   """
   with tf.variable_scope(
       name, default_name="conv_stride2_multistep", values=[x], reuse=reuse):
@@ -492,21 +825,25 @@ def deconv_stride2_multistep(x,
                              output_filters,
                              name=None,
                              reuse=None):
-  """Use a deconvolution to upsample x by 2**`nbr_steps`.
+  """使用卷积+reshape 的方式将 x 上采样 2**nbr_steps 倍（避免棋盘格问题）。
+
+  不使用转置卷积（deconv/conv2d_transpose），而是通过：
+  - 1D 情况：先用 1x1 卷积扩展通道数到 2 倍，然后 reshape 成 2 倍长度
+  - 2D 情况：先用 1x1 卷积扩展通道数到 4 倍，然后用 depth_to_space 进行空间扩展
+  
+  这种方式避免了转置卷积的棋盘格伪影问题。
 
   Args:
-    x: a `Tensor` with shape `[batch, spatial, depth]` or
-     `[batch, spatial_1, spatial_2, depth]`
-    nbr_steps: an int specifying the number of doubling upsample rounds to
-     apply.
-    output_filters: an int specifying the filter count for the deconvolutions
-    name: a string
-    reuse: a boolean
+    x: 输入张量，形状 [batch, spatial, depth] 或
+     [batch, spatial_1, spatial_2, depth]
+    nbr_steps: 上采样次数，最终空间维度扩大 2**nbr_steps 倍
+    output_filters: 输出通道数
+    name: 变量作用域名称
+    reuse: 是否重用变量
 
   Returns:
-    a `Tensor` with shape `[batch, spatial * (2**nbr_steps), output_filters]` or
-     `[batch, spatial_1 * (2**nbr_steps), spatial_2 * (2**nbr_steps),
-       output_filters]`
+    上采样后的张量，形状 [batch, spatial * (2**nbr_steps), output_filters] 或
+     [batch, spatial_1 * (2**nbr_steps), spatial_2 * (2**nbr_steps), output_filters]
   """
   with tf.variable_scope(
       name, default_name="deconv_stride2_multistep", values=[x], reuse=reuse):
@@ -551,7 +888,24 @@ def deconv_stride2_multistep(x,
 
 
 def conv_internal(conv_fn, inputs, filters, kernel_size, **kwargs):
-  """Conditional conv_fn making kernel 1d or 2d depending on inputs shape."""
+  """根据输入形状自动选择 1D 或 2D 卷积的内部实现函数。
+  
+  这是一个智能卷积包装器，主要功能：
+  1. 验证输入必须是 4D 张量（batch, height, width, channels）
+  2. 支持 LEFT padding：在序列左侧填充，适用于因果卷积（causal convolution）
+     - LEFT padding 保证每个位置只能看到它左边的信息（用于语言模型等自回归任务）
+  3. 根据 width=1（1D 序列）还是 width>1（2D 图像）自动选择合适的卷积核
+  
+  Args:
+    conv_fn: 实际的卷积函数（如 tf.layers.conv2d）
+    inputs: 4D 输入张量 [batch, height, width, channels]
+    filters: 卷积输出通道数
+    kernel_size: 卷积核大小（height, width）元组
+    **kwargs: 其他传递给 conv_fn 的参数（如 padding、strides、dilation_rate）
+    
+  Returns:
+    卷积输出张量
+  """
   static_shape = inputs.get_shape()
   if not static_shape or len(static_shape) != 4:
     raise ValueError("Inputs to conv must have statically known rank 4. "
@@ -589,6 +943,21 @@ def conv_internal(conv_fn, inputs, filters, kernel_size, **kwargs):
 
 
 def conv(inputs, filters, kernel_size, dilation_rate=(1, 1), **kwargs):
+  """标准 2D 卷积（内部使用 Keras Conv2D，支持 LEFT padding 和单/双维自动选择）。
+  
+  对于 1D 序列输入（width=1），自动使用 (kernel_size[0], 1) 的卷积核。
+  支持膨胀卷积（dilation，空洞卷积），可以在不增加参数的情况下扩大感受野。
+  
+  Args:
+    inputs: 4D 输入张量 [batch, height, width, channels]
+    filters: 输出通道数
+    kernel_size: 卷积核大小（height, width）元组
+    dilation_rate: 膨胀率，(height_dilation, width_dilation)
+    **kwargs: 其他传递给 Conv2D 的参数（padding、activation、name等）
+    
+  Returns:
+    卷积输出张量
+  """
   def _conv2d(x, *args, **kwargs):
     return layers().Conv2D(*args, **kwargs)(x)
   return conv_internal(
@@ -601,6 +970,21 @@ def conv(inputs, filters, kernel_size, dilation_rate=(1, 1), **kwargs):
 
 
 def conv1d(inputs, filters, kernel_size, dilation_rate=1, **kwargs):
+  """一维卷积：将 3D 张量 [batch, length, depth] 进行 1D 卷积。
+  
+  内部通过将输入扩展为 4D [batch, length, 1, depth]，
+  然后使用 (kernel_size, 1) 的 2D 卷积，再压缩回 3D。
+  
+  Args:
+    inputs: 3D 输入张量 [batch, length, depth]
+    filters: 输出通道数
+    kernel_size: 卷积核大小（整数）
+    dilation_rate: 膨胀率（整数）
+    **kwargs: 其他传递给 conv 的参数
+    
+  Returns:
+    3D 卷积输出张量 [batch, length, filters]
+  """
   return tf.squeeze(
       conv(tf.expand_dims(inputs, 2), filters, (kernel_size, 1),
            dilation_rate=(dilation_rate, 1), **kwargs),
@@ -608,13 +992,50 @@ def conv1d(inputs, filters, kernel_size, dilation_rate=1, **kwargs):
 
 
 def separable_conv(inputs, filters, kernel_size, **kwargs):
+  """深度可分离卷积（Depthwise Separable Convolution）。
+  
+  深度可分离卷积 = 深度卷积（Depthwise Convolution）+ 逐点卷积（Pointwise Convolution）：
+  - 深度卷积：对每个通道独立应用空间卷积，计算量更小
+  - 逐点卷积：用 1x1 卷积进行通道间的合并
+  
+  相比标准卷积，可分离卷积有更小的参数量和计算量，
+  在 MobileNet、EfficientNet 等轻量级模型中常用。
+  
+  Args:
+    inputs: 4D 输入张量 [batch, height, width, channels]
+    filters: 输出通道数
+    kernel_size: 卷积核大小
+    **kwargs: 其他参数
+    
+  Returns:
+    卷积输出张量
+  """
   def _sep_conv2d(x, *args, **kwargs):
     return layers().SeparableConv2D(*args, **kwargs)(x)
   return conv_internal(_sep_conv2d, inputs, filters, kernel_size, **kwargs)
 
 
 def subseparable_conv(inputs, filters, kernel_size, **kwargs):
-  """Sub-separable convolution. If separability == 0 it's a separable_conv."""
+  """子可分离卷积：将输入分成多个块，分别应用卷积后合并。
+  
+  通过 separability 参数控制分块数量：
+  - separability=0 或 None：等价于 separable_conv（完全可分离卷积）
+  - separability>0：将输入分成 abs(separability) 块，
+    每块用普通 2D 卷积处理，最后用 1x1 卷积合并
+  - separability<0：将输入分成 abs(separability) 块，
+    每块用可分离卷积处理，然后拼接
+  
+  这种分块方式在保持输出大小不变的情况下减少计算量。
+  
+  Args:
+    inputs: 4D 输入张量
+    filters: 输出通道数
+    kernel_size: 卷积核大小
+    **kwargs: 其他参数，可包含 separability 参数
+    
+  Returns:
+    卷积输出张量
+  """
 
   def conv_fn(inputs, filters, kernel_size, **kwargs):
     """Sub-separable convolution, splits into separability-many blocks."""
@@ -652,17 +1073,25 @@ def subseparable_conv(inputs, filters, kernel_size, **kwargs):
 
 
 def tpu_conv1d(inputs, filters, kernel_size, padding="SAME", name="tpu_conv1d"):
-  """Version of conv1d that works on TPU (as of 11/2017).
-
+  """适用于 TPU 的 1D 卷积实现（将卷积展开为多个密集的矩阵乘法）。
+  
+  标准 conv1d 将大卷积核实现为多个 kernel_size 次矩阵乘法的加和：
+  对于 kernel_size=k，分别对输入的不同偏移位置应用全连接，
+  然后将 k 个结果相加并缩放，这在 TPU 上比直接卷积彦更高效。
+  
+  实现原理：
+  - conv1d(内核大小=k) = sum_{i=0}^{k-1} dense(输入左移 i 位)
+  - 相当于横向展开卷积核
+  
   Args:
-    inputs: a Tensor with shape [batch, length, input_depth].
-    filters: an integer.
-    kernel_size: an integer.
-    padding: a string - "SAME" or "LEFT".
-    name: a string.
-
+    inputs: 3D 输入张量 [batch, length, input_depth]
+    filters: 输出特征维度
+    kernel_size: 卷积核大小（整数）
+    padding: 填充方式，"SAME"（两侧填充）或 "LEFT"（左侧填充，因果卷积）
+    name: 变量作用域名称
+    
   Returns:
-    a Tensor with shape [batch, length, filters].
+    3D 张量 [batch, length, filters]
   """
   if kernel_size == 1:
     return dense(inputs, filters, name=name, use_bias=True)
@@ -686,28 +1115,69 @@ def tpu_conv1d(inputs, filters, kernel_size, padding="SAME", name="tpu_conv1d"):
 
 
 def layer_norm_vars(filters):
-  """Create Variables for layer norm."""
+  """创建层归一化（Layer Normalization）所需的可训练变量。
+  
+  层归一化有两个可训练参数：
+  - scale（缩放）：初始值为 1，在归一化后对每个特征进行缩放
+  - bias（偏置）：初始值为 0，在缩放后加上偏置
+  
+  Args:
+    filters: 特征维度大小（归一化的最后一维的大小）
+    
+  Returns:
+    (scale, bias): 缩放参数和偏置参数，形状均为 [filters]
+  """
+  # scale 初始化为 1（归一化后不改变量级）
   scale = tf.get_variable(
       "layer_norm_scale", [filters], initializer=tf.ones_initializer())
+  # bias 初始化为 0（归一化后不偏移）
   bias = tf.get_variable(
       "layer_norm_bias", [filters], initializer=tf.zeros_initializer())
   return scale, bias
 
 
 def layer_norm_compute(x, epsilon, scale, bias, layer_collection=None):
-  """Layer norm raw computation."""
-
-  # Save these before they get converted to tensors by the casting below
+  """层归一化的核心数学计算。
+  
+  层归一化（Layer Normalization）是 Transformer 中至关重要的操作，
+  它对每个样本的特征维度进行归一化（而不是像 BatchNorm 那样对 batch 维度归一化）。
+  
+  数学公式：
+    mean = mean(x, axis=-1)        # 计算特征维度的均值
+    var = var(x, axis=-1)          # 计算特征维度的方差
+    norm_x = (x - mean) / sqrt(var + epsilon)  # 归一化
+    output = norm_x * scale + bias  # 可学习的缩放和偏移
+  
+  层归一化的优点：
+  - 不依赖 batch 大小（批归一化依赖 batch，推理时不稳定）
+  - 适合序列模型（RNN、Transformer），每个时间步独立归一化
+  - 帮助训练更稳定、加速收敛
+  
+  Args:
+    x: 输入张量，最后一维是特征维度
+    epsilon: 数值稳定性参数，防止除以零（通常为 1e-6）
+    scale: 可学习的缩放参数，形状 [filters]
+    bias: 可学习的偏置参数，形状 [filters]
+    layer_collection: 可选，Kronecker 因式分解近似曲率（KFAC）的层集合
+    
+  Returns:
+    归一化后的输出张量，形状与 x 相同
+  """
+  # 保存参数（在下面的类型转换之前保存，供 KFAC 使用）
   params = (scale, bias)
 
+  # 将 epsilon、scale、bias 转换为与 x 相同的数据类型（如 bfloat16）
   epsilon, scale, bias = [cast_like(t, x) for t in [epsilon, scale, bias]]
+  # 计算特征维度的均值（保持维度以便广播）
   mean = tf.reduce_mean(x, axis=[-1], keepdims=True)
+  # 计算特征维度的方差（使用 squared_difference 避免减法精度问题）
   variance = tf.reduce_mean(
       tf.squared_difference(x, mean), axis=[-1], keepdims=True)
+  # 归一化：减均值，除以标准差（rsqrt = 1/sqrt，加 epsilon 防止除零）
   norm_x = (x - mean) * tf.rsqrt(variance + epsilon)
 
+  # 应用可学习的缩放（scale）和偏移（bias）
   output = norm_x * scale + bias
-
 
   return output
 
@@ -718,48 +1188,116 @@ def layer_norm(x,
                name=None,
                reuse=None,
                layer_collection=None):
-  """Layer normalize the tensor x, averaging over the last dimension."""
+  """对张量 x 在最后一个维度上进行层归一化。
+  
+  这是 Transformer 中最常用的归一化方式，在每层的输入或输出上应用。
+  层归一化可以：
+  - 缓解梯度消失/爆炸问题
+  - 减少对初始化的敏感性
+  - 加速训练收敛
+  
+  Args:
+    x: 输入张量（任意维度，但最后一维是特征维度）
+    filters: 特征维度大小，None 时自动推断
+    epsilon: 归一化的数值稳定参数（1e-6）
+    name: 变量作用域名称
+    reuse: 是否重用已有变量
+    layer_collection: 可选，KFAC 的层集合
+    
+  Returns:
+    归一化后的张量，形状与 x 相同
+  """
   if filters is None:
-    filters = shape_list(x)[-1]
+    filters = shape_list(x)[-1]  # 自动推断最后一维的大小
   with tf.variable_scope(
       name, default_name="layer_norm", values=[x], reuse=reuse):
+    # 创建归一化参数（scale 和 bias）
     scale, bias = layer_norm_vars(filters)
+    # 执行层归一化计算
     return layer_norm_compute(x, epsilon, scale, bias,
                               layer_collection=layer_collection)
 
 
 def group_norm(x, filters=None, num_groups=8, epsilon=1e-5):
-  """Group normalization as in https://arxiv.org/abs/1803.08494."""
+  """组归一化（Group Normalization），论文：https://arxiv.org/abs/1803.08494。
+  
+  组归一化是层归一化和实例归一化的折中：
+  - 将特征通道分为若干组，在每组内进行归一化
+  - 当 num_groups=1 时，等价于层归一化（在整个特征维度归一化）
+  - 当 num_groups=filters 时，等价于实例归一化（每个通道单独归一化）
+  
+  优点：
+  - 不依赖 batch 大小（优于批归一化）
+  - 对图像任务比层归一化更有效（考虑了空间信息）
+  
+  Args:
+    x: 4D 输入张量，形状 [batch, height, width, filters]
+    filters: 通道数，None 时自动推断
+    num_groups: 分组数量（filters 必须能被 num_groups 整除）
+    epsilon: 数值稳定性参数
+    
+  Returns:
+    归一化后的 4D 张量，形状与 x 相同
+  """
   x_shape = shape_list(x)
   if filters is None:
     filters = x_shape[-1]
-  assert len(x_shape) == 4
-  assert filters % num_groups == 0
-  # Prepare variables.
+  assert len(x_shape) == 4  # 要求 4D 输入
+  assert filters % num_groups == 0  # 通道数必须能被分组数整除
+  # 创建可学习的缩放和偏置参数
   scale = tf.get_variable(
       "group_norm_scale", [filters], initializer=tf.ones_initializer())
   bias = tf.get_variable(
       "group_norm_bias", [filters], initializer=tf.zeros_initializer())
   epsilon, scale, bias = [cast_like(t, x) for t in [epsilon, scale, bias]]
-  # Reshape and compute group norm.
+  # 将通道维度分组：[batch, H, W, filters] -> [batch, H, W, groups, filters/groups]
   x = tf.reshape(x, x_shape[:-1] + [num_groups, filters // num_groups])
-  # Calculate mean and variance on heights, width, channels (not groups).
+  # 在 H、W 和组内通道维度上计算均值和方差（不跨组归一化）
   mean, variance = tf.nn.moments(x, [1, 2, 4], keep_dims=True)
   norm_x = (x - mean) * tf.rsqrt(variance + epsilon)
+  # 将形状恢复并应用缩放偏置
   return tf.reshape(norm_x, x_shape) * scale + bias
 
 
 def noam_norm(x, epsilon=1.0, name=None):
-  """One version of layer normalization."""
+  """Noam 归一化：基于 L2 归一化的简化版层归一化，无可学习参数。
+  
+  这是一种简单的归一化方式：
+  - 使用 L2 归一化（除以 L2 范数）代替标准差归一化
+  - 乘以 sqrt(d) 来维持原始量级
+  - 没有可学习的 scale 和 bias 参数（比标准层归一化参数更少）
+  
+  Args:
+    x: 输入张量
+    epsilon: 防止除零的小常数
+    name: 命名域名称
+    
+  Returns:
+    归一化后的张量，形状与 x 相同
+  """
   with tf.name_scope(name, default_name="noam_norm", values=[x]):
     shape = x.get_shape()
     ndims = len(shape)
+    # L2 归一化后乘以 sqrt(d) 恢复量级
     return (tf.nn.l2_normalize(x, ndims - 1, epsilon=epsilon) * tf.sqrt(
         to_float(shape[-1])))
 
 
 def l2_norm(x, filters=None, epsilon=1e-6, name=None, reuse=None):
-  """Layer normalization with l2 norm."""
+  """基于 L2 范数的层归一化，带可学习的 scale 和 bias 参数。
+  
+  与标准层归一化类似，但使用 L2 范数（平方和的平方根）武代标准差来归一化。
+  
+  Args:
+    x: 输入张量
+    filters: 特征维度，None 时自动推断
+    epsilon: 防止除零的小常数
+    name: 变量作用域名称
+    reuse: 是否重用变量
+    
+  Returns:
+    归一化后的张量，形状与 x 相同
+  """
   if filters is None:
     filters = shape_list(x)[-1]
   with tf.variable_scope(name, default_name="l2_norm", values=[x], reuse=reuse):
@@ -776,18 +1314,24 @@ def l2_norm(x, filters=None, epsilon=1e-6, name=None, reuse=None):
 
 
 def apply_spectral_norm(x):
-  """Normalizes x using the spectral norm.
+  """使用谱范数归一化 x（常用于 GAN 的判别器中）。
 
-  The implementation follows Algorithm 1 of
-  https://arxiv.org/abs/1802.05957. If x is not a 2-D Tensor, then it is
-  reshaped such that the number of channels (last-dimension) is the same.
+  实现参考论文 https://arxiv.org/abs/1802.05957 的算法 1。
+  
+  谱归一化（Spectral Normalization）是一种权重归一化方法，
+  它将权重除以权重矩阵的最大奇异值（谱范数 = 最大奇异值），
+  使网络满足 Lipschitz 连续条件，从而稳定 GAN 训练。
+  
+  算法使用冪迭q方法进行奇异分解，通过维护一个向量 u 的近似不断更新。
+  
+  如果 x 不是 2D 张量，就将其 reshape 使通道数（最后一维）不变。
 
   Args:
-    x: Tensor with the last dimension equal to the number of filters.
+    x: 最后一维等于通道数的张量（如卷积权重）
 
   Returns:
-    x: Tensor with the same shape as x normalized by the spectral norm.
-    assign_op: Op to be run after every step to update the vector "u".
+    x: 形状与 x 相同的谱范数归一化后的张量
+    assign_op: 每步训练后需要运行的于更新向量 "u" 的操作
   """
   weights_shape = shape_list(x)
   other, num_filters = tf.reduce_prod(weights_shape[:-1]), weights_shape[-1]
@@ -816,33 +1360,63 @@ def apply_spectral_norm(x):
 
 
 def apply_norm(x, norm_type, depth, epsilon, layer_collection=None):
-  """Apply Normalization."""
+  """根据 norm_type 参数选择并应用对应的归一化方法。
+  
+  这是一个归一化方法的统一分发函数，根据 norm_type 选择：
+  - "layer": 层归一化（Layer Norm，Transformer 默认方式）
+  - "group": 组归一化（Group Norm，适合图像任务）
+  - "batch": 批归一化（Batch Norm，适合 CNN）
+  - "noam":  Noam 归一化（简化版层归一化，无可学习参数）
+  - "l2":    L2 归一化变体
+  - "none":  不归一化，直接返回输入
+  
+  Args:
+    x: 输入张量
+    norm_type: 归一化类型字符串（见上方描述）
+    depth: 特征维度大小（层归一化使用）
+    epsilon: 归一化的数值稳定参数
+    layer_collection: 可选，KFAC 优化器的层集合（仅层归一化支持）
+    
+  Returns:
+    归一化后的张量，形状与 x 相同
+    
+  Raises:
+    ValueError: 如果 norm_type 不在支持的类型中
+  """
   if layer_collection is not None:
-    assert norm_type == "layer"
+    assert norm_type == "layer"  # KFAC 目前只支持层归一化
   if norm_type == "layer":
+    # 层归一化：Transformer 的标准选择
     return layer_norm(
         x, filters=depth, epsilon=epsilon, layer_collection=layer_collection)
   if norm_type == "group":
+    # 组归一化：适合图像任务
     return group_norm(x, filters=depth, epsilon=epsilon)
   if norm_type == "batch":
+    # 批归一化：适合 CNN，不依赖序列长度
     return layers().BatchNormalization(epsilon=epsilon)(x)
   if norm_type == "noam":
+    # Noam 归一化：简化版，无可学习参数
     return noam_norm(x, epsilon)
   if norm_type == "l2":
+    # L2 归一化
     return l2_norm(x, filters=depth, epsilon=epsilon)
   if norm_type == "none":
-    return x
+    return x  # 不归一化，直接返回
   raise ValueError("Parameter normalizer_fn must be one of: 'layer', 'batch',"
                    "'noam', 'lr', 'none'.")
 
 
 def zero_add(previous_value, x, name=None, reuse=None):
-  """Resnet connection with zero initialization.
+  """零初始化的跳跃连接（Zero-Init Residual Connection）。
 
-  Another type of resnet connection which returns previous_value + gamma * x.
-  gamma is a trainable scalar and initialized with zero. It is useful when a
-  module is plugged into a trained model and we want to make sure it matches the
-  original model's performance.
+  返回 previous_value + gamma * x，其中 gamma 是可训练标量且初始化为 0。
+  
+  用途：当将新模块插入到已训练模型中时，希望新模块初始时
+  不改变原模型的行为。gamma=0 保证初始时输出等于 previous_value，
+  随着训练 gamma 逐渐增大，新模块的贡献满渐增强。
+  
+  这是一种更安全的迎来步进加模块的方式。
 
   Args:
     previous_value:  A tensor.
@@ -869,50 +1443,68 @@ def layer_prepostprocess(previous_value,
                          name=None,
                          dropout_broadcast_dims=None,
                          layer_collection=None):
-  """Apply a sequence of functions to the input or output of a layer.
-
-  The sequence is specified as a string which may contain the following
-  characters:
-    a: add previous_value
-    n: apply normalization
-    d: apply dropout
-    z: zero add
-
-  For example, if sequence=="dna", then the output is
+  """对层的输入或输出依次应用一系列变换操作（层预处理/后处理的核心函数）。
+  
+  这是 Transformer 中每一层开始和结束时的关键操作序列。
+  变换序列由字符串指定，每个字符代表一种操作：
+    'a': 添加 previous_value（残差连接 Residual Connection）
+         将当前层的输入加到输出上，这是解决梯度消失问题的核心技术
+    'n': 应用归一化（Normalization，类型由 norm_type 决定，通常是层归一化）
+    'd': 应用 Dropout（随机丢弃神经元，用于正则化，防止过拟合）
+    'z': 零初始化残差连接（Zero Add，初始化时不改变原始模型行为）
+  
+  Transformer 的两种常见配置：
+  1. Post-LayerNorm（原始论文）: preprocess="none", postprocess="dan"
+     流程: x -> sublayer -> dropout -> add(x) -> layernorm
+     即：输出 = layernorm(x + dropout(sublayer(x)))
+  
+  2. Pre-LayerNorm（现代改进）: preprocess="n", postprocess="da"
+     流程: layernorm(x) -> sublayer -> dropout -> add(x)
+     即：输出 = x + dropout(sublayer(layernorm(x)))
+     这种方式训练更稳定（梯度流动更好）。
+  
+  例如，如果 sequence=="dna"，则操作为：
     previous_value + normalize(dropout(x))
-
+    即：先对 x 做 dropout，再归一化，最后加上残差连接
+  
   Args:
-    previous_value: A Tensor, to be added as a residual connection ('a')
-    x: A Tensor to be transformed.
-    sequence: a string.
-    dropout_rate: a float
-    norm_type: a string (see apply_norm())
-    depth: an integer (size of last dimension of x).
-    epsilon: a float (parameter for normalization)
-    default_name: a string
-    name: a string
-    dropout_broadcast_dims:  an optional list of integers less than 3
-      specifying in which dimensions to broadcast the dropout decisions.
-      saves memory.
-    layer_collection: A tensorflow_kfac.LayerCollection. Only used by the
-      KFAC optimizer. Default is None.
-
+    previous_value: 残差连接中被加的张量（通常是层输入）
+    x: 需要被变换的张量（通常是层输出）
+    sequence: 操作序列字符串（如 "dan"、"n"、"da"）
+    dropout_rate: Dropout 率（如 0.1 表示 10% 的神经元被丢弃）
+    norm_type: 归一化类型（见 apply_norm()）
+    depth: x 最后一维的大小（用于归一化）
+    epsilon: 归一化的数值稳定参数
+    default_name: 默认变量作用域名称
+    name: 变量作用域名称（None 时使用 default_name）
+    dropout_broadcast_dims: 可选的整数列表（维度数 < 3），
+                           指定在哪些维度上广播 dropout 决策（节省内存）
+    layer_collection: tensorflow_kfac 的 LayerCollection，仅 KFAC 优化器使用
+    
   Returns:
-    a Tensor
+    经过序列变换后的张量
   """
   with tf.variable_scope(name, default_name=default_name):
     if sequence == "none":
-      return x
+      return x  # "none" 表示不做任何处理
+    # 依次执行序列中的每个操作
     for c in sequence:
       if c == "a":
+        # 残差连接：将层输入加到当前张量上
+        # 这是 ResNet 思想：y = x + F(x)，让模型学习残差而非完整映射
         x += previous_value
       elif c == "z":
+        # 零初始化残差连接：output = previous_value + gamma * x
+        # gamma 初始化为 0，确保初始时模块不改变原始输出
+        # 适合将新模块插入已训练模型中（不破坏原有性能）
         x = zero_add(previous_value, x)
       elif c == "n":
+        # 归一化：对张量进行归一化（通常是层归一化）
         x = apply_norm(
             x, norm_type, depth, epsilon, layer_collection=layer_collection)
       else:
         assert c == "d", ("Unknown sequence step %s" % c)
+        # Dropout：以 dropout_rate 的概率随机丢弃神经元
         x = dropout_with_broadcast_dims(
             x, 1.0 - dropout_rate, broadcast_dims=dropout_broadcast_dims)
     return x
@@ -1002,20 +1594,24 @@ def conv_block_internal(conv_fn,
                         use_elu=False,
                         separabilities=None,
                         **kwargs):
-  """A block of convolutions.
+  """一个卷积块：多层卷积的封装，支持膨胀卷积、层归一化和各种激活函数。
 
+  这是多种卷积块（conv_block、conv1d_block 等）的通用内部实现。
+  每个卷积层的操作顺序：激活函数 -> 掩码 -> 卷积 -> 层归一化
+  
   Args:
-    conv_fn: convolution function, e.g. conv or separable_conv.
-    inputs: a Tensor
-    filters: an Integer
-    dilation_rates_and_kernel_sizes: a list of tuples (dilation, (k_w, k_h))
-    first_relu: whether to do a relu at start (defaults to True)
-    use_elu: whether to use ELUs instead of ReLUs (defaults to False)
-    separabilities: list of separability factors (per-layer).
-    **kwargs: additional arguments (e.g., pooling)
+    conv_fn: 卷积函数，如 conv 或 separable_conv
+    inputs: 输入张量
+    filters: 卷积输出通道数
+    dilation_rates_and_kernel_sizes: 展张率和卷积核大小的列表，格式为 [(dilation, (k_h, k_w)), ...]
+      列表中的每个元素对应一层卷积
+    first_relu: 是否在第一层卷积前应用激活函数（默认为 True）
+    use_elu: 是否使用 ELU 代替 ReLU（默认为 False）
+    separabilities: 可分离度列表（每层一个），用于 subseparable_conv
+    **kwargs: 其他传递给卷积函数的参数（如 pooling、padding 等）
 
   Returns:
-     a Tensor.
+     卷积块的输出张量
   """
 
   name = kwargs.pop("name") if "name" in kwargs else None
@@ -1066,33 +1662,75 @@ def conv_block_internal(conv_fn,
 
 
 def conv_block(inputs, filters, dilation_rates_and_kernel_sizes, **kwargs):
-  """A block of standard 2d convolutions."""
+  """标准 2D 卷积块：使用标准 2D 卷积的多层卷积组合。
+  
+  Args:
+    inputs: 输入张量
+    filters: 输出通道数
+    dilation_rates_and_kernel_sizes: [(dilation, kernel_size), ...] 列表
+    **kwargs: 其他参数
+  """
   return conv_block_internal(conv, inputs, filters,
                              dilation_rates_and_kernel_sizes, **kwargs)
 
 
 def conv1d_block(inputs, filters, dilation_rates_and_kernel_sizes, **kwargs):
-  """A block of standard 1d convolutions."""
+  """标准 1D 卷积块：使用 1D 卷积的多层卷积组合（适合序列模型）。
+  
+  Args:
+    inputs: 输入张量
+    filters: 输出通道数
+    dilation_rates_and_kernel_sizes: [(dilation, kernel_size), ...] 列表
+    **kwargs: 其他参数
+  """
   return conv_block_internal(conv1d, inputs, filters,
                              dilation_rates_and_kernel_sizes, **kwargs)
 
 
 def separable_conv_block(inputs, filters, dilation_rates_and_kernel_sizes,
                          **kwargs):
-  """A block of separable convolutions."""
+  """深度可分离卷积块：使用可分离卷积的多层卷积组合，比标准卷积更高效。
+  
+  Args:
+    inputs: 输入张量
+    filters: 输出通道数
+    dilation_rates_and_kernel_sizes: [(dilation, kernel_size), ...] 列表
+    **kwargs: 其他参数
+  """
   return conv_block_internal(separable_conv, inputs, filters,
                              dilation_rates_and_kernel_sizes, **kwargs)
 
 
 def subseparable_conv_block(inputs, filters, dilation_rates_and_kernel_sizes,
                             **kwargs):
-  """A block of separable convolutions."""
+  """子可分离卷积块：使用子可分离卷积的多层卷积组合。
+  
+  Args:
+    inputs: 输入张量
+    filters: 输出通道数
+    dilation_rates_and_kernel_sizes: [(dilation, kernel_size), ...] 列表
+    **kwargs: 其他参数
+  """
   return conv_block_internal(subseparable_conv, inputs, filters,
                              dilation_rates_and_kernel_sizes, **kwargs)
 
 
 def pool(inputs, window_size, pooling_type, padding, strides=(1, 1)):
-  """Pooling (supports "LEFT")."""
+  """池化操作，支持 LEFT padding（序列左侧填充，用于因果模型）。
+  
+  支持的池化类型：最大池化（MAX）、平均池化（AVG）等。
+  LEFT padding 保证当前位置的池化只能看到它左边的信息，符合自回归的因果性。
+  
+  Args:
+    inputs: 4D 输入张量 [batch, height, width, channels]
+    window_size: 池化窗口大小 (height, width)
+    pooling_type: 池化类型字符串（"MAX" 或 "AVG"）
+    padding: 填充方式，"SAME"、"VALID" 或 "LEFT"
+    strides: 步幅 (height_stride, width_stride)
+    
+  Returns:
+    池化后的张量
+  """
   with tf.name_scope("pool", values=[inputs]):
     static_shape = inputs.get_shape()
     if not static_shape or len(static_shape) != 4:
@@ -1124,7 +1762,27 @@ def conv_block_downsample(x,
                           separability=0,
                           name=None,
                           reuse=None):
-  """Implements a downwards-striding conv block, like Xception exit flow."""
+  """实现下采样卷积块，类似 Xception 网络的 Exit Flow 结构。
+  
+  结构：
+  1. 跳跃连接（res）：单层卷积，输出通道数 1.25*hidden_size
+  2. 主干道：两层子可分离卷积 + 池化，加上 res
+  3. 再两层子可分离卷积，输出通道数终到 2.5*hidden_size
+  
+  下采样通过 strides 参数实现，池化层进一步缩小空间分辨率。
+  
+  Args:
+    x: 输入张量
+    kernel: 卷积核大小
+    strides: 步幅（实现下采样）
+    padding: 填充方式
+    separability: 子可分离度
+    name: 变量作用域名称
+    reuse: 是否重用变量
+    
+  Returns:
+    下采样后的张量
+  """
   with tf.variable_scope(
       name, default_name="conv_block_downsample", values=[x], reuse=reuse):
     hidden_size = int(x.get_shape()[-1])
@@ -1171,16 +1829,28 @@ def get_timing_signal(length,
                       min_timescale=1,
                       max_timescale=1e4,
                       num_timescales=16):
-  """Create Tensor of sinusoids of different frequencies.
+  """创建不同频率的正弦信号张量（用于生成位置编码）。
 
+  Transformer 的位置编码使用不同频率的正弦和余弦函数的组合表示序列位置。
+  对于位置 i 和频率索引 k：
+  - PE(i, 2k) = sin(i / timescale_k)
+  - PE(i, 2k+1) = cos(i / timescale_k)
+  
+  其中 timescale 在 [min_timescale, max_timescale] 之间成几何级数展开。
+  
+  为什么这样设计？
+  - 低频分量：区分远距的位置关系
+  - 高频分量：区分近距的位置关系
+  - 正余弦组合：可以用加法公式表示相对位置，允许模型学习相对位置信息
+  
   Args:
-    length: Length of the Tensor to create, i.e. Number of steps.
-    min_timescale: a float
-    max_timescale: a float
-    num_timescales: an int
+    length: 序列长度（位置数）
+    min_timescale: 最小时频（最高频率）
+    max_timescale: 最大时频（最低频率）
+    num_timescales: 时频数量，输出向量维度 = 2 * num_timescales
 
   Returns:
-    Tensor of shape (length, 2*num_timescales)
+    形状为 (length, 2*num_timescales) 的位置编码张量
   """
   positions = to_float(tf.range(length))
   log_timescale_increment = (
@@ -1192,30 +1862,26 @@ def get_timing_signal(length,
 
 
 def add_timing_signal(x, min_timescale=1, max_timescale=1e4, num_timescales=16):
-  """Adds a bunch of sinusoids of different frequencies to a Tensor.
+  """将不同频率的正弦波位置编码加入输入张量中（Transformer 位置编码）。
 
-  This allows attention to learn to use absolute and relative positions.
-  The timing signal should be added to some precursor of both the source
-  and the target of the attention.
+  这使得注意力能够学习利用绝对和相对位置信息。
+  位置信号应该被加到注意力的源和目标序列的前身。
 
-  The use of relative position is possible because sin(x+y) and cos(x+y) can be
-  expressed in terms of y, sin(x) and cos(x).
+  支持相对位置的原因：sin(x+y) 和 cos(x+y) 可以用 y、sin(x)、cos(x) 表示，
+  因此模型可以由两个位置的编码推导它们的相对距离。
 
-  In particular, we use a geometric sequence of timescales starting with
-  min_timescale and ending with max_timescale.  For each timescale, we
-  generate the two sinusoidal signals sin(timestep/timescale) and
-  cos(timestep/timescale).  All of these sinusoids are concatenated in
-  the depth dimension, padded with zeros to be the same depth as the input,
-  and added into input.
+  具体实现：使用从 min_timescale 到 max_timescale 的几何级数列时频序列。
+  对每个时频，生成两个正弦信号 sin(timestep/timescale) 和 cos(timestep/timescale)。
+  所有正弦信号拼接在深度维度，并填充零以匹配输入深度，然后加入输入。
 
   Args:
-    x: a Tensor with shape [?, length, ?, depth]
-    min_timescale: a float
-    max_timescale: a float
-    num_timescales: an int <= depth/2
+    x: 形状为 [?, length, ?, depth] 的张量
+    min_timescale: 最小时频（最大频率）
+    max_timescale: 最大时频（最小频率）
+    num_timescales: 时频数，必须 <= depth/2
 
   Returns:
-    a Tensor the same shape as x.
+    与 x 形状相同的张量，已加入位置编码
   """
   length = shape_list(x)[1]
   depth = shape_list(x)[3]
@@ -1226,38 +1892,43 @@ def add_timing_signal(x, min_timescale=1, max_timescale=1e4, num_timescales=16):
 
 
 def mask_from_embedding(emb):
-  """Input embeddings -> padding mask.
+  """从嵌入向量生成 padding 掩码（笔展位置为 0，其他位置为 1）。
 
-  We have hacked symbol_modality to return all-zero embeddings for padding.
-  Returns a mask with 0.0 in the padding positions and 1.0 elsewhere.
+  symbol_modality 被修改为对填充位置返回全零嵌入向量。
+  这个函数利用这一特性，通过检测嵌入向量是否全为零来判断填充位置。
 
   Args:
-    emb: a Tensor with shape [batch, width, height, depth].
+    emb: 嵌入张量，形状 [batch, width, height, depth]
   Returns:
-    a 0.0/1.0 Tensor with shape [batch, width, height, 1].
+    0.0/1.0 浮点型掩码，形状 [batch, width, height, 1]
+    - 1.0：非填充位置（有效内容）
+    - 0.0：填充位置（PAD token）
   """
   return weights_nonzero(tf.reduce_sum(tf.abs(emb), axis=3, keepdims=True))
 
 
 def length_from_embedding(emb):
-  """Compute the length of each sequence in the batch.
+  """从嵌入张量计算每个序列的实际长度（不包括 padding）。
 
   Args:
-    emb: a sequence embedding Tensor with shape [batch, max_time, 1, depth].
+    emb: 序列嵌入张量，形状 [batch, max_time, 1, depth]
   Returns:
-    a Tensor with shape [batch].
+    形状为 [batch] 的整数张量，表示每个序列的实际长度
   """
   return tf.cast(tf.reduce_sum(mask_from_embedding(emb), [1, 2, 3]), tf.int32)
 
 
 def mask_pos_gt(source_length, target_length):
-  """A mask with 1.0 wherever source_pos > target_pos and 0.0 elsewhere.
+  """生成模果序列 source_pos > target_pos 时为 1.0，否则为 0.0 的掩码。
+  
+  这个掩码将 target_pos < source_pos 的位置隐蚀（也就是 target 位置前面的 source 位置）。
+  通常用于注意力的序列不对空掌。
 
   Args:
-    source_length: an integer
-    target_length: an integer
+    source_length: source 序列长度
+    target_length: target 序列长度
   Returns:
-    a Tensor with shape [1, target_length, source_length]
+    形状为 [1, target_length, source_length] 的浮点掩码张量
   """
   return tf.expand_dims(
       tf.cast(tf.greater(tf.expand_dims(tf.range(target_length), axis=0),
@@ -1266,13 +1937,16 @@ def mask_pos_gt(source_length, target_length):
 
 
 def mask_leq(target_length, source_length):
-  """A mask with 1.0 wherever source_pos <= target_pos and 0.0 elsewhere.
+  """生成 source_pos <= target_pos 时为 1.0 的下三角掩码（包括对角线）。
+  
+  这是 Transformer 解码器自回归注意力的核心掩码：
+  确保位置 i 的 token 只能看到位置 0‘1 、...i 的 token（不能看未来）。
 
   Args:
-    target_length: an integer
-    source_length: an integer
+    target_length: target 序列长度（行数）
+    source_length: source 序列长度（列数）
   Returns:
-    a Tensor with shape [1, target_length, source_length]
+    形状为 [1, target_length, source_length] 的下三角浮点掩码张量
   """
   return ones_matrix_band_part(
       target_length,
@@ -1283,13 +1957,16 @@ def mask_leq(target_length, source_length):
 
 
 def mask_pos_lt(source_length, target_length):
-  """A mask with 1.0 wherever source_pos < target_pos and 0.0 elsewhere.
+  """生成 source_pos < target_pos 时为 1.0，否则为 0.0 的严格下三角掩码（不包括对角线）。
+  
+  与 mask_leq 类似，但是不包括对角线（source_pos = target_pos 时为 0）。
+  用于需要严格因果性的场景（不能看当前位置）。
 
   Args:
-    source_length: an integer
-    target_length: an integer
+    source_length: source 序列长度
+    target_length: target 序列长度
   Returns:
-    a Tensor with shape [1, target_length, source_length]
+    形状为 [1, target_length, source_length] 的浮点掩码张量
   """
   return tf.expand_dims(
       tf.cast(tf.less(tf.expand_dims(tf.range(target_length), axis=0),
@@ -1298,16 +1975,19 @@ def mask_pos_lt(source_length, target_length):
 
 
 def relu_density_logit(x, reduce_dims):
-  """logit(density(x)).
+  """logit(density(x))，用于可视化 ReLU 激活密度的直方图。
 
-  Useful for histograms.
+  计算 ReLU 激活密度的 logit （反转数几何平均），用于特征分布的可视化。
+  
+  长期处于 0 付近的密度或 1 付近的密度均可能表明梯度消失。
+  返回的 logit 值易于在气步图中观察。
 
   Args:
-    x: a Tensor, typically the output of tf.relu
-    reduce_dims: a list of dimensions
+    x: 通常是 tf.relu 输出的张量
+    reduce_dims: 需要除去的维度列表
 
   Returns:
-    a Tensor
+    张量，内容是 logit(密度)
   """
   frac = tf.reduce_mean(to_float(x > 0.0), reduce_dims)
   scaled = tf.log(frac + math.exp(-10)) - tf.log((1.0 - frac) + math.exp(-10))
@@ -1315,15 +1995,18 @@ def relu_density_logit(x, reduce_dims):
 
 
 def maybe_zero_out_padding(inputs, kernel_size, nonpadding_mask):
-  """If necessary, zero out inputs to a conv for padding positions.
+  """如果必要，将序列填充位置的卷积输入置零。
+
+  对于 kernel_size != 1 的卷积，填充位置上的张量可能会影响邻近位置（内死区渗出）。
+  这个函数将填充位置的输入置零，避免填啂位置影响卷积结果。
 
   Args:
-    inputs: a Tensor with shape [batch, length, ...]
-    kernel_size: an integer or pair of integers
-    nonpadding_mask: a Tensor with shape [batch, length]
+    inputs: 张量，形状 [batch, length, ...]
+    kernel_size: 卷积核大小（整数或整数对）
+    nonpadding_mask: 非填啂位置的浮点掩码，形状 [batch, length]（非填啂为 1，填啂为 0）
 
   Returns:
-    Tensor of the same shape as inputs.
+    与 inputs 形状相同的张量，填啂位置已置零
   """
   if (kernel_size != 1 and kernel_size != (1, 1) and
       nonpadding_mask is not None):
@@ -1342,7 +2025,31 @@ def dense_relu_dense(inputs,
                      dropout_broadcast_dims=None,
                      layer_collection=None,
                      name=None):
-  """Hidden layer with RELU activation followed by linear projection."""
+  """前馈神经网络（FFN）：全连接 -> ReLU 激活 -> Dropout -> 全连接。
+  
+  这是 Transformer 设计中每个层的前馈网络（Feed-Forward Network, FFN）的实现。
+  原始论文中， FFN = Linear(ReLU(Linear(x)))，通常隐藏层维度 filter_size = 4 * d_model。
+  
+  操作流程：
+  1. dense(inputs, filter_size) + ReLU ：将特征维度扩展并激活
+  2. dropout：训练时随机丢弃少数神经元
+  3. dense(h, output_size)：将特征维度庋减回原始大小
+  
+  注意：使用 "conv1"、"conv2" 作为变量名称是历史原因，实际上是全连接层。
+  
+  Args:
+    inputs: 输入张量，形状 [batch, length, depth]
+    filter_size: FFN 隐藏层大小（通常为 4 * d_model）
+    output_size: FFN 输出大小（通常为 d_model）
+    output_activation: 输出激活函数，None 表示线性（无激活）
+    dropout: Dropout 率，0.0 表示不使用
+    dropout_broadcast_dims: Dropout 的广播维度列表
+    layer_collection: KFAC 的层集合
+    name: 变量作用域名称
+    
+  Returns:
+    FFN 输出张量，形状 [batch, length, output_size]
+  """
   # layer_name is appended with "conv1" or "conv2" in this method only for
   # historical reasons. These are in fact dense layers.
   layer_name = "%s_{}" % name if name else "{}"
@@ -1372,7 +2079,25 @@ def dense_dropconnect(inputs,
                       dropconnect_dropout=0.0,
                       name="dense_dropconnect",
                       **kwargs):
-  """Dense layer with dropconnect."""
+  """带 DropConnect 的全连接层。
+  
+  DropConnect 是 Dropout 的变种：
+  - Dropout：训练时随机将一些神经元的输出置零
+  - DropConnect：训练时随机将一些权重（连接）置零
+  具有类似的正则化效果，但在某些情况下也许有更好效果。
+  
+  实现上，将 Dropout 作为卷积核的正则化函数应用于权重张量。
+  
+  Args:
+    inputs: 输入张量
+    output_size: 输出维度
+    dropconnect_dropout: DropConnect 的 dropout 率，0.0 表示不使用
+    name: 变量作用域名称
+    **kwargs: 其他传递给 dense 的参数
+    
+  Returns:
+    全连接层输出张量
+  """
 
   if dropconnect_dropout != 0.0:
     tf.logging.info("Applying dropconnect as the kernel regularization.")
@@ -1393,27 +2118,29 @@ def conv_relu_conv(inputs,
                    name=None,
                    cache=None,
                    decode_loop_step=None):
-  """Hidden layer with RELU activation followed by linear projection.
+  """卷积 + ReLU 激活 + 卷积的前馈层（支持缓存加速解码）。
+
+  与 dense_relu_dense 类似，但使用卷积代替全连接，适合序列中具有局部层次结构的任务。
+  
+  支持连接缓存（Key-Value Cache），用于 Transformer 解码器的快速推理：
+  - 常规模式：将当前输入倒接到 cache 中，保留最近 kernel_size 个时间步
+  - TPU 模式（decode_loop_step != None）：使用原地更新代替拼接，附合 TPU 内存局限
 
   Args:
-    inputs: A tensor.
-    filter_size: An integer.
-    output_size: An integer.
-    first_kernel_size: An integer.
-    second_kernel_size: An integer.
-    padding: A string.
-    nonpadding_mask: A tensor.
-    dropout: A float.
-    name: A string.
-    cache: A dict, containing Tensors which are the results of previous
-        attentions, used for fast decoding.
-    decode_loop_step: An integer, step number of the decoding loop.
-        Only used for inference on TPU. If it is not None, the function
-        will do inplace update for the cache instead of concatenating the
-        current result to the cache.
+    inputs: 输入张量
+    filter_size: FFN 隐藏层大小
+    output_size: FFN 输出大小
+    first_kernel_size: 第一个卷积的卷积核大小
+    second_kernel_size: 第二个卷积的卷积核大小
+    padding: 填充方式
+    nonpadding_mask: 非填啂位置的浮点掩码
+    dropout: Dropout 率
+    name: 变量作用域名称
+    cache: 包含之前注意力结果的字典，用于快速解码
+    decode_loop_step: 解码循环的步数，仅在 TPU 推理时使用
 
   Returns:
-    A Tensor.
+    输出张量
   """
   with tf.variable_scope(name, "conv_relu_conv", [inputs]):
     inputs = maybe_zero_out_padding(inputs, first_kernel_size, nonpadding_mask)
@@ -1458,7 +2185,27 @@ def sepconv_relu_sepconv(inputs,
                          nonpadding_mask=None,
                          dropout=0.0,
                          name=None):
-  """Hidden layer with RELU activation followed by linear projection."""
+  """可分离卷积 + ReLU + 可分离卷积的前馈层实现。
+  
+  与 dense_relu_dense 和 conv_relu_conv 类似，但使用深度可分离卷积，
+  参数更少、计算更高效。默认使用 LEFT padding（因果卷积）。
+  
+  操作流程：写可分离卷积 -> ReLU -> Dropout -> 可分离卷积
+  
+  Args:
+    inputs: 输入张量（支持 3D 和 4D）
+    filter_size: FFN 隐藏层大小
+    output_size: FFN 输出大小
+    first_kernel_size: 第一个可分离卷积的卷积核大小
+    second_kernel_size: 第二个可分离卷积的卷积核大小
+    padding: 填充方式（默认 LEFT，适合自回归语言模型）
+    nonpadding_mask: 非填啂位置的浮点掩码
+    dropout: Dropout 率
+    name: 变量作用域名称
+    
+  Returns:
+    FFN 输出张量
+  """
   with tf.variable_scope(name, "sepconv_relu_sepconv", [inputs]):
     inputs = maybe_zero_out_padding(inputs, first_kernel_size, nonpadding_mask)
     if inputs.get_shape().ndims == 3:
@@ -1483,7 +2230,7 @@ def sepconv_relu_sepconv(inputs,
     return ret
 
 
-# DEPRECATED - use dense_relu_dense, conv_relu_conv, sepconv_relu_sepconv
+# DEPRECATED - 请使用 dense_relu_dense、conv_relu_conv 或 sepconv_relu_sepconv
 def conv_hidden_relu(inputs,
                      hidden_size,
                      output_size,
@@ -1491,7 +2238,10 @@ def conv_hidden_relu(inputs,
                      second_kernel_size=(1, 1),
                      dropout=0.0,
                      **kwargs):
-  """Hidden layer with RELU activation followed by linear projection."""
+  """已废弃：卷积 + ReLU 激活 + 线性射影（请使用 dense_relu_dense 或 conv_relu_conv）。
+  
+  与 dense_relu_dense 类似，但使用卷积层。当 kernel_size=(1,1) 时等价于全连接。
+  """
   name = kwargs.pop("name") if "name" in kwargs else None
   with tf.variable_scope(name, "conv_hidden_relu", [inputs]):
     if inputs.get_shape().ndims == 3:
@@ -1523,7 +2273,29 @@ def conv_gru(x,
              dilation_rate=(1, 1),
              name=None,
              reuse=None):
-  """Convolutional GRU in 1 dimension."""
+  """卷积 GRU（门控循环单元），将卷积用于序列处理。
+  
+  GRU（Gated Recurrent Unit）是 LSTM 的简化版本，只有重置门和更新门。
+  卷积 GRU 使用卷积替代全连接，可以利用空间局部性。
+  
+  实现：
+  - reset gate: r = saturating_sigmoid(conv(x)) ：控制应保留多少历史状态
+  - update gate: g = saturating_sigmoid(conv(x)) ：控制新状态的更新量
+  - candidate: c = tanh(conv(r * x)) ：候选新状态
+  - output = g * x + (1 - g) * c ：加权合并历史和候选状态
+  
+  Args:
+    x: 输入张量 [batch, length, ...]
+    kernel_size: 卷积核大小
+    filters: 卷积输出通道数
+    padding: 填充方式
+    dilation_rate: 膨胀率
+    name: 变量作用域名称
+    reuse: 是否重用变量
+    
+  Returns:
+    GRU 输出张量，形状与 x 相同
+  """
 
   # Let's make a shorthand for conv call first.
   def do_conv(args, name, bias_start, padding):
@@ -1584,7 +2356,29 @@ def conv_lstm(x,
               dilation_rate=(1, 1),
               name=None,
               reuse=None):
-  """Convolutional LSTM in 1 dimension."""
+  """卷积 LSTM（长短期记忆单元），将卷积用于序列处理。
+  
+  LSTM 有 4 个门：输入门、遗忘门、输出门和候选内容，分别控制信息流。
+  卷积 LSTM 使用卷积计算这 4 个门，利用空间局部性。
+  
+  实现（简化版）：
+  - gates = conv(x, 4*filters)：一次卷积计算出所有门
+  - 层归一化后分割为 4 组
+  - new_cell = sigmoid(g[0]) * x + sigmoid(g[1]) * tanh(g[3])  # 单元状态更新
+  - output = sigmoid(g[2]) * tanh(new_cell)  # 输出门
+  
+  Args:
+    x: 输入张量 [batch, length, 1, depth]
+    kernel_size: 卷积核大小
+    filters: 卷积输出通道数
+    padding: 填充方式
+    dilation_rate: 膨胀率
+    name: 变量作用域名称
+    reuse: 是否重用变量
+    
+  Returns:
+    LSTM 输出张量。注意：这是无状态的单步 LSTM，不维护本地单元状态
+  """
   with tf.variable_scope(
       name, default_name="conv_lstm", values=[x], reuse=reuse):
     gates = conv(
@@ -1604,7 +2398,26 @@ def diagonal_conv_gru(x,
                       dropout=0.0,
                       name=None,
                       reuse=None):
-  """Diagonal Convolutional GRU as in https://arxiv.org/abs/1702.08727."""
+  """对角卷积 GRU，参见论文 https://arxiv.org/abs/1702.08727。
+  
+  在标准卷积 GRU 基础上增加了对角移动（Diagonal Shift）：
+  - 将 filters 个通道分为 3 组：中同、左移、右移
+  - 通过深度卷积将不同组的通道分别往不同方向移动
+  - 这使得网络能表示更丰富的时间局次关系
+  
+  使用硬 sigmoid 门函数（hard_sigmoid）代替饱和 sigmoid，计算更高效。
+  
+  Args:
+    x: 输入张量
+    kernel_size: 卷积核大小
+    filters: 卷积输出通道数
+    dropout: Dropout 率应用于候选状态
+    name: 变量作用域名称
+    reuse: 是否重用变量
+    
+  Returns:
+    (output, total_cost_avg): 输出张量和门饱和惩罚平均値
+  """
 
   # Let's make a shorthand for conv call first.
   def do_conv(args, name, bias_start):
@@ -1641,7 +2454,19 @@ def diagonal_conv_gru(x,
 
 
 def pad_to_same_length(x, y, final_length_divisible_by=1, axis=1):
-  """Pad tensors x and y on axis 1 so that they have the same length."""
+  """将张量 x 和 y 在指定轴填啂使它们长度相同。
+  
+  常用于计算损失时对齐 logits 和 labels 的长度。
+  
+  Args:
+    x: 张量
+    y: 张量
+    final_length_divisible_by: 填啂后的长度必须能被此数整除（用于向量化操作）
+    axis: 填啂的维度，1 或 2
+    
+  Returns:
+    (padded_x, padded_y): 填啂后的两个张量，它们在指定轴上长度相同
+  """
   if axis not in [1, 2]:
     raise ValueError("Only axis=1 and axis=2 supported for now.")
   with tf.name_scope("pad_to_same_length", values=[x, y]):
@@ -1681,7 +2506,11 @@ def pad_to_same_length(x, y, final_length_divisible_by=1, axis=1):
 
 
 def pad_with_zeros(logits, labels):
-  """Pad labels on the length dimension to match logits length."""
+  """将 labels 在长度维度上填啂零以匹配 logits 长度。
+  
+  计算损失时确保 logits 和 labels 的序列长度一致。
+  对于 2D labels，同时在 axis=1 和 axis=2 上对齐。
+  """
   with tf.name_scope("pad_with_zeros", values=[logits, labels]):
     logits, labels = pad_to_same_length(logits, labels)
     if len(labels.shape) == 3:  # 2-d labels.
@@ -1690,21 +2519,24 @@ def pad_with_zeros(logits, labels):
 
 
 def weights_nonzero(labels):
-  """Assign weight 1.0 to all labels except for padding (id=0)."""
+  """为所有非零标签分配权重 1.0，填啂 token（id=0）的权重为 0.0。
+  
+  最常用的损失权重函数：确保损失计算中填啂 token 不贡献。
+  """
   return to_float(tf.not_equal(labels, 0))
 
 
 def weights_prepend_inputs_to_targets(labels):
-  """Assign weight 1.0 to only the "targets" portion of the labels.
+  """在 prepend_mode 中，为标签的 "targets" 部分分配权重 1.0。
 
-  Weight 1.0 is assigned to all nonzero labels past the first zero.
-  See prepend_mode in common_hparams.py
+  在 prepend 模式中，输入和输出拼接在一起：[source tokens] [0] [target tokens]
+  其中 0 是分隔符。这个函数为第一个零之后的所有非零标签分配权重 1.0。
 
   Args:
-    labels: A Tensor of int32s.
+    labels: int32 类型的张量
 
   Returns:
-    A Tensor of floats.
+    浮点型权重张量
   """
   past_first_zero = tf.cumsum(to_float(tf.equal(labels, 0)), axis=1)
   nonzero = to_float(labels)
@@ -1712,7 +2544,17 @@ def weights_prepend_inputs_to_targets(labels):
 
 
 def check_nonnegative(value):
-  """Check that the value is nonnegative."""
+  """检查值是否为非负数（支持张量和 Python 数字）。
+  
+  Args:
+    value: 要检查的张量或 Python 数字
+    
+  Returns:
+    value 本身（加了检查依赖的张量）
+    
+  Raises:
+    ValueError: 如果 value 是 Python 数字且小于 0
+  """
   if isinstance(value, tf.Tensor):
     with tf.control_dependencies([tf.assert_greater_equal(value, 0)]):
       value = tf.identity(value)
@@ -1722,19 +2564,21 @@ def check_nonnegative(value):
 
 
 def weights_multi_problem(labels, taskid=-1):
-  """Assign weight 1.0 to only the "targets" portion of the labels.
+  """多任务损失权重：为标签序列中 taskid 后面的部分分配权重 1.0。
 
-  Weight 1.0 is assigned to all labels past the taskid.
+  在多任务训练尾巴式设置中，序列格式为：
+  [source tokens] [taskid] [target tokens]
+  其中 taskid 是任务标识符。这个函数为 taskid 后面的 target tokens 分配权重 1.0。
 
   Args:
-    labels: A Tensor of int32s.
-    taskid: an int32 representing the task id for a problem.
+    labels: int32 类型的张量
+    taskid: 任务标识符的整数 ID
 
   Returns:
-    A Tensor of floats.
+    浮点型权重张量
 
   Raises:
-    ValueError: The Task ID must be valid.
+    ValueError: taskid 必须是有效的非负整数
   """
   taskid = check_nonnegative(taskid)
   past_taskid = tf.cumsum(to_float(tf.equal(labels, taskid)), axis=1)
@@ -1745,7 +2589,11 @@ def weights_multi_problem(labels, taskid=-1):
 
 
 def weights_multi_problem_all(labels, taskid=-1):
-  """Assign weight 1.0 to only examples from the given task."""
+  """多任务全程权重：对给定任务的整个示例（输入+输出）分配权重 1.0。
+  
+  与 weights_multi_problem 的区别：后者只对 target 部分分配权重，
+  而这个函数对包含该 taskid 的整个示例（包括 source 和 target）分配权重。
+  """
   taskid = check_nonnegative(taskid)
   weights = to_float(tf.not_equal(labels, 0))
   past_taskid = tf.cumsum(to_float(tf.equal(labels, taskid)), axis=1)
@@ -1761,7 +2609,10 @@ def weights_multi_problem_all(labels, taskid=-1):
 
 
 def weights_multi_problem_input(labels, taskid=-1):
-  """Assign weight 1.0 to only the inputs for the given task."""
+  """多任务输入权重：只对给定任务的输入部分分配权重 1.0。
+  
+  与 weights_multi_problem 相反：仅对 taskid 前面的 source tokens 分配权重。
+  """
   taskid = check_nonnegative(taskid)
   weights_all_tokens = weights_multi_problem_all(labels, taskid)
   weights_target = weights_multi_problem(labels, taskid)
@@ -1769,26 +2620,32 @@ def weights_multi_problem_input(labels, taskid=-1):
 
 
 def weights_all(labels):
-  """Assign weight 1.0 to all labels."""
+  """为所有标签分配权重 1.0（包括填啂 token）。
+  
+  与 weights_nonzero 不同，这个函数不跳过填啂 token，对所有位置计算损失。
+  """
   return tf.ones_like(labels, dtype=tf.float32)
 
 
 def weights_concatenated(labels):
-  """Assign weight 1.0 to the "target" part of the concatenated labels.
+  """为拼接标签的 "target" 部分分配权重 1.0（多句对训练时使用）。
 
-  The labels look like:
+  标签的格式如下：
     source English I love you . ID1 target French Je t'aime . ID1 source
       English the cat ID1 target French le chat ID1 source English ...
 
-  We want to assign weight 1.0 to all words in the target text (including the
-  ID1 end symbol), but not to the source text or the boilerplate.  In the
-  above example, the target words that get positive weight are:
+  其中 ID1 是句对分隔符。我们希望为目标文本的所有单词（包括 ID1 结尾符）
+  分配权重 1.0，但不包括源语言文本和模板。上面的例子中，获得正权重的目标单词是：
     Je t'aime . ID1 le chat ID1
 
+  实现方式：
+  1. 通过 EOS (ID=1) 计算句号，奇数句编号 = target
+  2. 排除每句头两个模板 token
+
   Args:
-    labels: a Tensor
+    labels: 标签张量
   Returns:
-    a Tensor
+    浮点型权重张量
   """
   eos_mask = tf.to_int32(tf.equal(labels, 1))
   sentence_num = tf.cumsum(eos_mask, axis=1, exclusive=True)
@@ -1809,27 +2666,29 @@ def padded_cross_entropy(logits,
                          reduce_sum=True,
                          cutoff=0.0,
                          gaussian=False):
-  """Compute cross-entropy assuming 0s are padding.
+  """计算序列分类任务的小垫交叉熵损失（忽略填啂 token）。
 
-  Computes a loss numerator (the sum of losses), and loss denominator
-  (the number of non-padding tokens).
+  计算损失分子（损失对加和）和损失分母（有效 token 数）。
+  分母/分子的商是每 token 的平均损失。
+
+  支持标签平滑（label smoothing）：
+  给小部分概率了其他类别，防止模型对训练数据过度自信，改善泛化。
 
   Args:
-    logits: a `Tensor` with shape `[batch, timesteps, vocab_size]`.
-      optionally a FactoredTensor.
-    labels: an integer `Tensor` with shape `[batch, timesteps]`.
-    label_smoothing: a floating point `Scalar`.
-    weights_fn: A function from labels to weights.
-    reduce_sum: a Boolean, whether to sum at the end or not.
-    cutoff: a float, at which point to have no loss.
-    gaussian: If true, use a Gaussian distribution for label smoothing
+    logits: 形状 [batch, timesteps, vocab_size] 的张量，或 FactoredTensor
+    labels: 形状 [batch, timesteps] 的整数张量
+    label_smoothing: 标签平滑系数（0 表示不平滑，0.1 是常用值）
+    weights_fn: 将标签映射到权重的函数（默认忽略填啂 token）
+    reduce_sum: 是否返回标量级损失（True）还是分位置损失（False）
+    cutoff: 此值以下的损失不计入（通过 ReLU 切雴）
+    gaussian: 如果为 True，使用高斯分布进行标签平滑
 
   Returns:
-    loss_numerator: a `Scalar`.  Sum of losses.
-    loss_denominator: a `Scalar.  The number of non-padding target tokens.
+    loss_numerator: 标量，损失对加和。
+    loss_denominator: 标量，非填啂目标 token 的数量。
 
   Raises:
-    ValueError: in case of unsupported argument types.
+    ValueError: 当参数类型不支持时
   """
   if isinstance(logits, FactoredTensor):
     if gaussian:
@@ -1868,30 +2727,33 @@ def padded_cross_entropy(logits,
 
 
 def _weights_one_third(labels):
-  """Returns Tensor of shape [batch, height, width]. Each element is 1/3."""
+  """返回形状为 [batch, height, width] 的张量，每个元素为 1/3。
+  
+  用于 RGB 图像损失计算：将 3 通道的损失均分权重以计算每像素平均损失。
+  """
   return tf.ones(tf.shape(labels)[:-1]) / 3.
 
 
 def dml_loss(pred, labels, weights_fn=_weights_one_third, reduce_sum=True):
-  """Discretized mixture of logistics loss.
+  """离散化混合逻辑斯分布损失（Discretized Mixture of Logistics Loss）。
+  
+  用于图像生成模型（如 PixelCNN）的像素级损失函数。
+  将每个像素的 RGB 条件分布建as 多个离散化逻辑斯分布的混合，
+  能够表达多模的像素分布。
 
   Args:
-    pred: A [batch, height, width, num_mixtures*10] tensor of floats
-      comprising one unconstrained mixture probability, three means
-      (one per channel), three standard deviations (one per channel),
-      and three coefficients which linearly parameterize dependence across
-      channels.
-    labels: A [batch, height, width, channels] tensor of 8-bit pixel
-      intensities. The computation assumes channels is 3.
-    weights_fn: A function of labels, returning a Tensor of shape
-      [batch, height, width] which weights each loss term. Default is to scale
-      each loss term by 1/3 so that they capture the average across channels.
-    reduce_sum: A boolean, to return scalar loss instead of per position.
+    pred: 形状 [batch, height, width, num_mixtures*10] 的浮点张量
+      包括：一个未约束混合概率、三个均値（每通道一个）、三个标准差、
+      三个跨通道线性依赖系数
+    labels: 形状 [batch, height, width, channels] 的 8位像素张量（假定 channels=3）
+    weights_fn: 将标签映射到 [batch, height, width] 权重的函数。
+      默认将每个损失项缩放 1/3，捕获通道间的平均
+    reduce_sum: 是否返回标量损失而非每位置损失
 
   Returns:
-    Tuple of loss tensors for numerator and denominator, each a scalar if
-    reduce_sum else of shape [batch, height, width]. The sum of their divisions
-    is the number of nats for each pixel in labels.
+    (loss_num, loss_den) 元组，分别是损失分子和分母
+    当 reduce_sum=True 时为标量，否则为 [batch, height, width] 形状
+    二者之商表示 labels 中每像素的 nats 数（信息量）
   """
   real_labels = convert_rgb_to_symmetric_real(labels)
   dml_loss_value = discretized_mix_logistic_loss(pred=pred, labels=real_labels)
@@ -1905,20 +2767,17 @@ def dml_loss(pred, labels, weights_fn=_weights_one_third, reduce_sum=True):
 
 
 def split_to_discretized_mix_logistic_params(inputs):
-  """Splits input tensor into parameters of discretized mixture logistic.
+  """将输入张量分割成离散化混合逻辑斯分布的各个参数张量。
 
   Args:
-    inputs: A [batch, height, width, num_mixtures*10] tensor of floats
-      comprising one unconstrained mixture probability, three means
-      (one per channel), three standard deviations (one per channel),
-      and three coefficients which linearly parameterize dependence across
-      channels.
+    inputs: 形状 [batch, height, width, num_mixtures*10] 的浮点张量
+      包括：一个未约束的混合概率、三个均値（每通道）、三个标准差，
+      以及三个跨通道线性依赖系数
 
   Returns:
-    Tuple of unconstrained mixture probabilities, locations, scales, and
-    coefficient parameters of the distribution. The mixture probability has
-    shape [batch, height, width, num_mixtures]. Other parameters have shape
-    [batch, height, width, num_mixtures, 3].
+    (混合概率, 均値, 对数标准差, 系数) 元组。
+    混合概率形状：[batch, height, width, num_mixtures]
+    其他参数形状：[batch, height, width, num_mixtures, 3]
   """
   batch, height, width, output_dim = shape_list(inputs)  # pylint: disable=unbalanced-tuple-unpacking
   num_mixtures = output_dim // 10
@@ -2022,19 +2881,24 @@ def discretized_mix_logistic_loss(pred, labels):
 
 
 def sample_from_discretized_mix_logistic(pred, seed=None):
-  """Sampling from a discretized mixture of logistics.
+  """从离散化混合逻辑斯分布中采样（用于图像生成）。
+
+  推理时用于根据模型输出的参数生成新像素。
+  实现步骤：
+  1. 使用 Gumbel-Max 技巧采样混合分量索引
+  2. 选择对应分量的参数（均値、标准差、系数）
+  3. 从 3D 逻辑斯分布中采样（通过等价均匀采样转换）
+  4. 使用系数对通道间进行线性依赖校正
+  5. 输出截断到 [-1, 1]
 
   Args:
-    pred: A [batch, height, width, num_mixtures*10] tensor of floats
-      comprising one unconstrained mixture probability, three means
-      (one per channel), three standard deviations (one per channel),
-      and three coefficients which linearly parameterize dependence across
-      channels.
-    seed: Random seed.
+    pred: 形状 [batch, height, width, num_mixtures*10] 的浮点张量
+      包括：一个未约束混合概率、三个均値（每通道一个）、三个标准差，
+      以及三个跨通道线性依赖系数
+    seed: 随机数种子
 
   Returns:
-    A tensor of shape [batch, height, width, 3] with real intensities scaled
-    between -1 and 1.
+    形状为 [batch, height, width, 3] 的张量，像素强度缩放至 [-1, 1]
   """
 
   logits, locs, log_scales, coeffs = split_to_discretized_mix_logistic_params(
@@ -2075,19 +2939,23 @@ def smoothing_cross_entropy(logits,
                             vocab_size,
                             confidence,
                             gaussian=False):
-  """Cross entropy with label smoothing to limit over-confidence.
+  """带标签平滑的交叉熵，降低模型过度自信。
+
+  标签平滑（Label Smoothing）是一种正则化技术：
+  - 不是对留实类别使用 one-hot（信心 confidence=1.0）
+  - 而是将少量概率分配给其他类别（每个类别 low_confidence）
+  - 这样可以防止模型对训练标签过度自信，改善泛化
 
   Args:
-    logits: Tensor of shape [batch_size, ?, ?, ?, vocab_size].
-    labels: Tensor of shape [batch_size, ?, ?, ?].
-    vocab_size: Tensor representing the size of the vocabulary.
-    confidence: Used to determine on and off values for label smoothing.
-      If `gaussian` is true, `confidence` is the variance to the Gaussian
-      distribution.
-    gaussian: Uses a Gaussian distribution for label smoothing
+    logits: 形状 [batch_size, ?, ?, ?, vocab_size] 的张量
+    labels: 形状 [batch_size, ?, ?, ?] 的张量
+    vocab_size: 词表大小（张量或整数）
+    confidence: 留实类别的概率。
+      如果 gaussian=True，则表示高斯分布的方差
+    gaussian: 是否使用高斯分布进行标签平滑
 
   Returns:
-    Tensor of shape [batch_size, ?, ?, ?].
+    形状 [batch_size, ?, ?, ?] 的交叉熵张量
   """
   with tf.name_scope("smoothing_cross_entropy", values=[logits, labels]):
     # Low confidence is given to all non-true labels, uniformly.
@@ -2120,21 +2988,19 @@ def smoothing_cross_entropy(logits,
 
 
 def global_pool_1d(inputs, pooling_type="MAX", mask=None):
-  """Pool elements across the last dimension.
+  """在序列维度上进行全局池化，将序列转换为单个向量。
 
-  Useful to convert a list of vectors into a single vector so as
-  to get a representation of a set.
+  用于将向量列表转换为单个向量，从而获得集合的表示。
+  常用于集合分类任务，将可变长度序列压缩为固定大小的表示向量。
 
   Args:
-    inputs: A tensor of shape [batch_size, sequence_length, input_dims]
-      containing the sequences of input vectors.
-    pooling_type: the pooling type to use, MAX or AVR
-    mask: A tensor of shape [batch_size, sequence_length] containing a
-      mask for the inputs with 1's for existing elements, and 0's elsewhere.
+    inputs: 形状 [batch_size, sequence_length, input_dims] 的张量
+    pooling_type: 池化类型，"MAX"（最大池化）或 "AVR"（平均池化）
+    mask: 形状 [batch_size, sequence_length] 的浮点掩码张量，
+      1 表示有效元素，0 表示填啂
 
   Returns:
-    A tensor of shape [batch_size, input_dims] containing the sequences of
-    transformed vectors.
+    形状 [batch_size, input_dims] 的张量，序列的全局表示
   """
   with tf.name_scope("global_pool", values=[inputs]):
     if mask is not None:
@@ -2157,16 +3023,17 @@ def global_pool_1d(inputs, pooling_type="MAX", mask=None):
 
 
 def running_global_pool_1d(inputs, pooling_type="MAX"):
-  """Same global pool, but only for the elements up to the current element.
+  """按序列累积进行全局池化（每个位置只看到它前面的元素）。
 
-  Useful for outputs where the state of future elements is not known.
-  Takes no mask as all elements up to the current element are assumed to exist.
-  Currently only supports maximum. Equivalent to using a lower triangle bias.
+  与 global_pool_1d 相同，但每个位置只对该位置之前的元素进行池化。
+  适用于未来状态不得而知的输出实现（因果池化）。
+  假定从开始到当前位置的所有元素均有效（无需掩码）。
+  等价于使用下三角偏置的注意力模式。
+  目前只支持最大池化。
 
   Args:
-    inputs: A tensor of shape [batch_size, sequence_length, input_dims]
-      containing the sequences of input vectors.
-    pooling_type: Pooling type to use. Currently only supports 'MAX'.
+    inputs: 形状 [batch_size, sequence_length, input_dims] 的张量
+    pooling_type: 池化类型，目前只支持 'MAX'。
 
   Returns:
     A tensor of shape [batch_size, sequence_length, input_dims] containing the
@@ -2185,18 +3052,24 @@ def running_global_pool_1d(inputs, pooling_type="MAX"):
 
 
 def gated_linear_unit_layer(x, name=None):
-  """Gated linear unit layer.
+  """门控线性单元（GLU）层实现。
 
-  Paper: Language Modeling with Gated Convolutional Networks.
-  Link: https://arxiv.org/abs/1612.08083
-  x = Wx * sigmoid(W'x).
+  论文：Language Modeling with Gated Convolutional Networks
+  链接：https://arxiv.org/abs/1612.08083
+  
+  实现公式：x_new = Wx * sigmoid(W'x)
+  将输入分为两部分：内容部分和门控部分。
+  内容部分经过 sigmoid 门控的过滤。
+  
+  GLU 是全连接层和 sigmoid 激活的组合，对内容进行选择性开可，
+  类似于 GRU 中的门控机制。
 
   Args:
-    x: A tensor
-    name: A string
+    x: 张量输入
+    name: 变量作用域名称
 
   Returns:
-    A tensor of the same shape as x.
+    与 x 形状相同的张量
   """
   with tf.variable_scope(name, default_name="glu_layer", values=[x]):
     depth = shape_list(x)[-1]
@@ -2211,24 +3084,35 @@ def sru(x,
         initial_state=None,
         name=None,
         reuse=None):
-  """SRU cell as in https://arxiv.org/abs/1709.02755.
+  """简单循环单元（SRU），参见论文 https://arxiv.org/abs/1709.02755。
 
-  This implementation uses tf.scan and can incur overhead, see the full SRU
-  function doc for details and an implementation that is sometimes faster.
+  SRU（Simple Recurrent Unit）是一种循环神经网络单元，设计为容易并行化：
+  - 将线性变换和状态转移分离，线性变换可并行计算
+  - 状态转移不依赖上一时间步的状态，可用 tf.scan 高效实现
+  
+  对于每层：
+  - 并行计算：[x, f, r] = Dense(x_input)
+    - x：内容向量
+    - f：遗忘门（forget gate）
+    - r：高速连接门（highway gate）
+  - 递归计算：c[t] = f[t] * c[t-1] + (1-f[t]) * x[t] (tf.scan)
+  - 输出：h[t] = r[t] * c[t] + (1-r[t]) * x_orig[t]
+  
+  这个实现使用 tf.scan，有一定开销，另见完整版本的文档获取更快实现。
 
   Args:
-    x: A tensor of shape [batch, ..., channels] ; ... is treated as time.
-    num_layers: How many SRU layers; default is 2 as results for 1 disappoint.
-    activation: Optional activation function, try tf.nn.tanh or tf.nn.relu.
-    initial_state: Optional initial c-state, set to zeros if None.
-    name: Optional name, "sru" by default.
-    reuse: Optional reuse.
+    x: 形状 [batch, ..., channels] 的张量；... 被视为时间维度
+    num_layers: SRU 层数，默认为 2（单层效果较差）
+    activation: 可选的激活函数，可尝试 tf.nn.tanh 或 tf.nn.relu
+    initial_state: 可选的初始 c 状态，None 时初始化为零
+    name: 可选的名称，默认 "sru"
+    reuse: 可选的重用标志
 
   Returns:
-    A tensor of the same shape as x.
+    与 x 形状相同的张量
 
   Raises:
-    ValueError: if num_layers is not positive.
+    ValueError: 如果 num_layers 不是正整数
   """
   if num_layers < 1:
     raise ValueError("Number of layers must be positive: %d" % num_layers)
@@ -2274,28 +3158,22 @@ def linear_set_layer(layer_size,
                      activation_fn=tf.nn.relu,
                      dropout=0.0,
                      name=None):
-  """Basic layer type for doing funky things with sets.
+  """对集合每个元素应用线性变换的基本集合层。
 
-  Applies a linear transformation to each element in the input set.
-  If a context is supplied, it is concatenated with the inputs.
-    e.g. One can use global_pool_1d to get a representation of the set which
-    can then be used as the context for the next layer.
-
-  TODO: Add bias add (or control the biases used).
+  对输入集合中每个元素应用线性变换。
+  如果提供了上下文，将其与输入混合（通过加法实现广播）。
+  例：可用 global_pool_1d 获取集合表示，然后作为下一层的上下文。
 
   Args:
-    layer_size: Dimension to transform the input vectors to.
-    inputs: A tensor of shape [batch_size, sequence_length, input_dims]
-      containing the sequences of input vectors.
-    context: A tensor of shape [batch_size, context_dims] containing a global
-      statistic about the set.
-    activation_fn: The activation function to use.
-    dropout: Dropout probability.
-    name: name.
+    layer_size: 输入向量变换的目标维度
+    inputs: 形状 [batch_size, sequence_length, input_dims] 的张量
+    context: 形状 [batch_size, context_dims] 的全局上下文张量
+    activation_fn: 使用的激活函数
+    dropout: Dropout 概率
+    name: 变量作用域名称
 
   Returns:
-    Tensor of shape [batch_size, sequence_length, output_dims] containing the
-    sequences of transformed vectors.
+    形状 [batch_size, sequence_length, output_dims] 的张量
   """
   with tf.variable_scope(
       name, default_name="linear_set_layer", values=[inputs]):
@@ -2329,26 +3207,26 @@ def ravanbakhsh_set_layer(layer_size,
                           activation_fn=tf.nn.tanh,
                           dropout=0.0,
                           name=None):
-  """Layer from Deep Sets paper: https://arxiv.org/abs/1611.04500 .
+  """来自 Deep Sets 论文的集合层：https://arxiv.org/abs/1611.04500。
 
-  More parameter-efficient version of a linear-set-layer with context.
+  带上下文的 linear_set_layer 的更高参数效率版本。
+  
+  Deep Sets 的核心思想：每个元素的输入减去整个集合的全局表示，
+  让层学习元素与集合之间的差异。
+  持丢序不变性，即集合的顺序不影响结果（如果 sequential=False）。
 
   Args:
-    layer_size: Dimension to transform the input vectors to.
-    inputs: A tensor of shape [batch_size, sequence_length, vector]
-      containing the sequences of input vectors.
-    mask: A tensor of shape [batch_size, sequence_length] containing a
-      mask for the inputs with 1's for existing elements, and 0's elsewhere.
-    sequential: If true, will use a running global pool so each element will
-      only depend on those before it. Set true if this layer is being used in
-      an output sequence.
-    activation_fn: The activation function to use.
-    dropout: dropout.
-    name: name.
+    layer_size: 输入向量变换的目标维度
+    inputs: 形状 [batch_size, sequence_length, vector] 的张量
+    mask: 形状 [batch_size, sequence_length] 的掩码，1=有效，0=填啂
+    sequential: 如果为 True，使用 running_global_pool ，
+      使每个元素只依赖它前面的元素（用于自回归输出）
+    activation_fn: 使用的激活函数
+    dropout: Dropout 概率
+    name: 变量作用域名称
 
   Returns:
-    Tensor of shape [batch_size, sequence_length, vector] containing the
-    sequences of transformed vectors.
+    形状 [batch_size, sequence_length, vector] 的张量
   """
   del dropout
   with tf.variable_scope(name, "ravanbakhsh_set_layer", [inputs]):
@@ -2366,7 +3244,14 @@ def ravanbakhsh_set_layer(layer_size,
 
 
 def fn_device_dependency_dict():
-  """State container for fn_device_dependency."""
+  """获取当前默认计算图的设备依赖字典（函数间跨设备同步的状态容器）。
+  
+  用于 fn_device_dependency 上下文管理器的内部实现。
+  每个 name+device 组合对应一个控制依赖列表，确保同一设备上相同名称的操作按顺序执行。
+  
+  Returns:
+    defaultdict：键是 name_device 字符串，值是控制依赖的 Tensor 列表
+  """
   default_graph = tf.get_default_graph()
   if not hasattr(default_graph, "dependency_dict"):
     default_graph.dependency_dict = collections.defaultdict(list)
@@ -2375,7 +3260,20 @@ def fn_device_dependency_dict():
 
 @contextlib.contextmanager
 def fn_device_dependency(name, device=""):
-  """Add control deps for name and device."""
+  """添加同一名称和设备之间的控制依赖（确保顺序执行的上下文管理器）。
+  
+  用于确保同一设备上相同名称的操作不会乱序执行：
+  - 下一次调用会等待上一次调用的输出就绪后再执行
+  - 主要用于内存高效实现中分批次处理时保证顺序
+  
+  使用方式：
+    with fn_device_dependency("my_fn", device="/gpu:0") as outs:
+      outs[:] = [some_computation()]  # 输出必须写入 outs
+  
+  Args:
+    name: 依赖组名称，相同名称的调用之间会有控制依赖
+    device: 可选设备字符串（如 '/gpu:0'，'' 表示默认设备）
+  """
   key = name + "_" + device
   outs = []
 
@@ -2398,16 +3296,18 @@ def fn_device_dependency(name, device=""):
 
 
 def underlying_variable_ref(t):
-  """Find the underlying variable ref.
+  """查找张量对应的底层变量引用（穿透 Identity、ReadVariableOp、Enter 等操作）。
 
-  Traverses through Identity, ReadVariableOp, and Enter ops.
-  Stops when op type has Variable or VarHandle in name.
+  用于追踪一个张量是否来自某个 tf.Variable：
+  - 跳过 Identity（恒等变换）、ReadVariableOp（变量读取）、Enter（进入 while_loop）等透明操作
+  - 找到包含 'Variable' 或 'VarHandle' 的 op 时停止
+  - 如果无法找到变量引用，返回 None
 
   Args:
-    t: a Tensor
+    t: 任意张量
 
   Returns:
-    a Tensor that is a variable ref, or None on error.
+    底层变量引用张量（Tensor），或者 None（如果 t 不是变量操作的结果）
   """
   while t.op.type in ["Identity", "ReadVariableOp", "Enter"]:
     t = t.op.inputs[0]
@@ -2420,13 +3320,13 @@ def underlying_variable_ref(t):
 
 
 def underlying_variable(t):
-  """Find the underlying tf.Variable object.
+  """找到张量对应的底层 tf.Variable 对象。
 
   Args:
-    t: a Tensor
+    t: 张量
 
   Returns:
-    tf.Variable.
+    对应的 tf.Variable 对象
   """
   t = underlying_variable_ref(t)
   assert t is not None
@@ -2440,15 +3340,18 @@ def underlying_variable(t):
 
 
 def approximate_split(x, num_splits, axis=0):
-  """Split approximately equally into num_splits parts.
+  """将张量尽量均分地分割为 num_splits 个分。
+
+  当张量大小不能被 num_splits 整除时，分配余数到前第几分。
+  用于将大张量分块计算，备内存。
 
   Args:
-    x: a Tensor
-    num_splits: an integer
-    axis: an integer.
+    x: 张量
+    num_splits: 分割数量
+    axis: 分割轴（默认 axis=0）
 
   Returns:
-    a list of num_splits Tensors.
+    包含 num_splits 个张量的列表
   """
   size = shape_list(x)[axis]
   size_splits = [tf.div(size + i, num_splits) for i in range(num_splits)]
@@ -2456,16 +3359,15 @@ def approximate_split(x, num_splits, axis=0):
 
 
 class FactoredTensor(object):
-  """A concise factored representation of Tensor as two tensors.
+  """张量的分解表示：用两个张量的矩阵乘积表示大张量。
 
-  This class represents the tensor tf.matmul(a, b, transpose_b=True)
-  by storing the values of Tensors a and b.
+  这个类代表张量 tf.matmul(a, b, transpose_b=True)，
+  通过存储张量 a 和 b 的值而不是直接计算完整乘积。
 
-  The reason for this is that the product may be too big to fully realize at
-  once, so it can be realized a part at a time.
+  设计原因：乘积张量可能太大一次性不能全部实现，
+  可以分次少量实现。
 
-  "a" may have extra leading dimensions, in which case they are flattened out
-  before computing the matrix product, then re-expanded afterwards.
+  a 可能有额外的领头维度，在计算之前会先展平，然后在实现后重新扩展。
   """
 
   def __init__(self, a, b):
@@ -2541,18 +3443,19 @@ def smoothing_cross_entropy_factored_grad(op, dy):
     compiled=True,
     separate_compiled_gradients=True)
 def smoothing_cross_entropy_factored(a, b, labels, confidence):
-  """Memory-efficient computation of smoothing cross-entropy.
-
-  Avoids realizing the entire logits matrix at once.
+  """内存高效的平滑交叉熵计算，避免一次性实现完整 logits 矩阵。
+  
+  通过将 logits = matmul(a, b.T) 分批计算，每次只实现 logits 的一小部分，
+  然后立即计算损失，避免内存溢出。
 
   Args:
-    a: a Tensor with shape [batch, inner_dim]
-    b: a Tensor with shape [vocab_size, inner_dim]
-    labels: an integer Tensor with shape [batch]
-    confidence: a float
+    a: 形状 [batch, inner_dim] 的张量
+    b: 形状 [vocab_size, inner_dim] 的张量（嵌入矩阵）
+    labels: 形状 [batch] 的整数张量
+    confidence: 浮点数（留实类别的概率）
 
   Returns:
-    A Tensor with shape [batch]
+    形状 [batch] 的张量
   """
   num_splits = 16
   vocab_size = shape_list(b)[0]
@@ -2572,21 +3475,20 @@ def padded_cross_entropy_factored(factored_logits,
                                   label_smoothing,
                                   weights_fn=weights_nonzero,
                                   reduce_sum=True):
-  """Memory-efficient computation of smoothing cross-entropy.
+  """内存高效的填啂交叉熵计算，攟持 FactoredTensor 输入。
 
-  Avoids realizing the entire logits matrix at once.
+  避免一次性实现完整 logits 矩阵。
 
   Args:
-    factored_logits: a `FactoredTensor` representing a Tensor
-       with shape `[batch, timesteps, vocab_size]`.
-    labels: an integer `Tensor` with shape `[batch, timesteps]`.
-    label_smoothing: a floating point `Scalar`.
-    weights_fn: A function from labels to weights.
-    reduce_sum: a Boolean, whether to sum at the end or not.
+    factored_logits: 表示形状 [batch, timesteps, vocab_size] 的 FactoredTensor
+    labels: 形状 [batch, timesteps] 的整数张量
+    label_smoothing: 标签平滑系数
+    weights_fn: 将标签映射到权重的函数
+    reduce_sum: 是否返回标量损失
 
   Returns:
-    loss_numerator: a `Scalar`.  Sum of losses.
-    loss_denominator: a `Scalar.  The number of non-padding target tokens.
+    loss_numerator: 标量，损失对加和
+    loss_denominator: 标量，非填啂目标 token 的数量
   """
   a = factored_logits.a
   b = factored_logits.b
@@ -2604,11 +3506,14 @@ def padded_cross_entropy_factored(factored_logits,
 
 
 def fn_with_custom_grad(grad_fn, use_global_vars=False):
-  """Decorator to create a subgraph with a custom gradient function.
+  """装饰器：创建带自定义梯度函数的子图。
 
-  The subgraph created by the decorated function is NOT put in a Defun and so
-  does not suffer from the limitations of the Defun (all subgraph ops on the
-  same device, no summaries).
+  被装饰函数创建的子图不会放入 Defun 中，因此不受 Defun 的限制：
+  - 子图操作可以在不同设备上
+  - 支持求和操作（summaries）
+  
+  常用于实现梯度检置点（gradient checkpointing）或其他需要
+  自定义梯度的场景（如使用近似梯度提高效率）。
 
   Args:
     grad_fn: function with signature
@@ -2708,22 +3613,26 @@ def conv_hidden_relu_memory_efficient(x,
                                       forget=True,
                                       test_vars=None,
                                       name=None):
-  """LayerNorm, Conv, ReLU, Conv.
+  """内存高效的：LayerNorm + Conv + ReLU + Conv，支持梯度检置点。
 
-  All convolutions have kernel size 1.
+  所有卷积核大小为 1（等价于全连接）。
 
-  returns conv(relu(conv(layer_norm(x))))
+  返回 conv(relu(conv(layer_norm(x))))
+  
+  当 forget=True 时，使用梯度检置点（gradient checkpointing）：
+  - 前向传播时不保留中间激活，节约内存
+  - 反向传播时重新计算激活值（用时间换内存）
 
   Args:
-    x: input Tensor with shape [batch, length, io_size]
-    filter_size: an integer - size of the hidden layer.
-    epsilon: a float (for layer norm)
-    forget: a boolean - forget forwards activations and recompute on backprop
-    test_vars: optional tuple of variables for testing purposes
-    name: an optional string
+    x: 形状 [batch, length, io_size] 的输入张量
+    filter_size: 隐藏层大小（整数）
+    epsilon: 层归一化的数字稳定性参数
+    forget: 布尔就是否遭忘前向激活并在反向传播时重新计算
+    test_vars: 用于测试的可选变量元组
+    name: 可选的变量作用域名称
 
   Returns:
-    a Tensor with shape [batch, length, io_size]
+    形状 [batch, length, io_size] 的张量
   """
   io_size = x.get_shape().as_list()[-1]
 
@@ -2813,7 +3722,15 @@ def conv_hidden_relu_memory_efficient(x,
 
 
 def shape_list(x):
-  """Return list of dims, statically where possible."""
+  """返回张量各维度大小列表，尽可能使用静态形状。
+  
+  这是 Tensor2Tensor 中最常用的工具函数之一。
+  问题：tf.shape(x) 返回动态形状（运行时算），而 x.get_shape() 返回静态形状（可能有 None）。
+  这个函数将两者结合：尽量使用静态值（更高效），如果有 None 则使用动态形状。
+  
+  Returns:
+    列表，元素是静态整数（形状已知）或者 TF 张量（形状未知）
+  """
   x = tf.convert_to_tensor(x)
 
   # If unknown rank, return dynamic shape
@@ -2832,6 +3749,14 @@ def shape_list(x):
 
 
 def list_product(els):
+  """计算列表中所有元素的乘积（支持整数和 TF 张量）。
+  
+  Args:
+    els: 整数或张量的列表
+    
+  Returns:
+    所有元素的乘积
+  """
   prod = els[0]
   for el in els[1:]:
     prod *= el
@@ -2839,14 +3764,20 @@ def list_product(els):
 
 
 def sample_with_temperature(logits, temperature, sampling_keep_top_k=-1):
-  """Either argmax or random sampling.
+  """从 logits 中采样：temperature=0 时为 argmax，>0 时为随机采样。
+
+  temperature 控制采样的随机性：
+  - temperature=0.0：確定性选择最高概率的 token（贪心解码）
+  - temperature=1.0：按模型原始概率分布采样
+  - temperature>1.0：更平滑的分布，增加多样性
+  - temperature<1.0：更尖锐的分布，深化最常见的 token
 
   Args:
-    logits: a Tensor.
-    temperature: a float  0.0=argmax 1.0=random
-    sampling_keep_top_k: If not -1, only sample from the top k logits.
+    logits: 张量
+    temperature: 浮点数，0.0=argmax，1.0=随机采样
+    sampling_keep_top_k: 如果不是 -1，只从 top-k 个 logits 中采样。
   Returns:
-    a Tensor with one fewer dimension than logits.
+    比 logits 少一个维度的张量（采样结果）
   """
   if temperature == 0.0:
     # TF argmax doesn't handle >5 dimensions, so we reshape here.
@@ -2880,16 +3811,18 @@ def sample_with_temperature(logits, temperature, sampling_keep_top_k=-1):
 
 
 def _select_top_k(logits, top_k):
-  """Replaces logits, expect the top k highest values, with small number (-1e6).
+  """将 logits 中非 top-k 的位置设为 -1e6（将其概率近似归零）。
 
-  If k is -1 don't replace anything.
+  用于 top-k 采样：只允许从 logits 最高的 k 个类别中采样。
+  支持按样本特制的 k 値（即每个样本可以使用不同的 k）。
+  k=-1 时不进行任何过滤。
 
   Args:
-    logits: A `Tensor` of shape [batch_size, ..., vocab_size]
-    top_k: vector of batch size.
+    logits: 形状 [batch_size, ..., vocab_size] 的张量
+    top_k: batch_size 大小的 k 向量
 
   Returns:
-    A `Tensor` with same shape  as logits.
+    与 logits 形状相同的张量，非 top-k 位置已设为 -1e6
   """
   vocab_size = logits.shape[-1]
 
@@ -2904,14 +3837,17 @@ def _select_top_k(logits, top_k):
 
 
 def sample_temperature_per_example(logits, temperature, sampling_keep_top_k=-1):
-  """Either random sampling with different temperature per example.
+  """每个样本使用独立采样温度进行随机采样。
+
+  与 sample_with_temperature 类似，但允许批次内每个样本使用不同的温度。
+  适用于需要批次内不同多样性的场景。
 
   Args:
-    logits: a Tensor.
-    temperature: a float vector of same size as logits.
-    sampling_keep_top_k: If not -1, only sample from the top k logits.
+    logits: 张量
+    temperature: 浮点向量，尺寸与 logits 的批次大小一致
+    sampling_keep_top_k: 如果不是 -1，只从 top-k 个 logits 中采样
   Returns:
-    a Tensor with one fewer dimension than logits.
+    比 logits 少一个维度的张量（采样结果）
   """
   logits = _select_top_k(logits, sampling_keep_top_k)
   logits /= tf.reshape(temperature, [-1] + [1] * (len(logits.shape) - 1))
@@ -2923,19 +3859,22 @@ def sample_temperature_per_example(logits, temperature, sampling_keep_top_k=-1):
 
 
 def ones_matrix_band_part(rows, cols, num_lower, num_upper, out_shape=None):
-  """Matrix band part of ones.
+  """创建只在指定对角带内为 1、其他为 0 的矩阵（任意形状）。
+  
+  用于创建注意力掩码（如因果掩码、近端注意力树、滑动窗口注意力）。
+  
+  num_lower=-1 表示对角线以下没有限制（连接所有之前的位置）。
+  num_upper=-1 表示对角线以上没有限制。
 
   Args:
-    rows: int determining number of rows in output
-    cols: int
-    num_lower: int, maximum distance backward. Negative values indicate
-      unlimited.
-    num_upper: int, maximum distance forward. Negative values indicate
-      unlimited.
-    out_shape: shape to reshape output by.
+    rows: 输出矩阵的行数
+    cols: 输出矩阵的列数
+    num_lower: 下方对角带宽度（-1 表示不限制）
+    num_upper: 上方对角带宽度（-1 表示不限制）
+    out_shape: 用于重塑形状的可选形状
 
   Returns:
-    Tensor of size rows * cols reshaped into shape out_shape.
+    大小为 rows * cols 重塑为 out_shape 的张量
   """
   if all([isinstance(el, int) for el in [rows, cols, num_lower, num_upper]]):
     # Needed info is constant, so we construct in numpy
@@ -2960,7 +3899,10 @@ def ones_matrix_band_part(rows, cols, num_lower, num_upper, out_shape=None):
 
 
 def reshape_like_all_dims(a, b):
-  """Reshapes a to match the shape of b."""
+  """将 a reshape 为与 b 形状完全匹配。
+  
+  在非 eager mode 下试图传播静态形状。
+  """
   ret = tf.reshape(a, tf.shape(b))
   if not tf.executing_eagerly():
     ret.set_shape(b.get_shape())
@@ -2968,16 +3910,19 @@ def reshape_like_all_dims(a, b):
 
 
 def recompute_grad(fn):
-  """Decorator that recomputes the function on the backwards pass.
+  """装饰器：在反向传播时重新计算函数（梯度检置点 / Gradient Checkpointing）。
+
+  这是一种用时间换内存的策略：
+  - 前向传播：正常执行函数，但不保留中间激活（节约内存）
+  - 反向传播：重新计算激活并计算梯度（耗时间）
+  
+  特别适用于大型模型训练，当激活擦叠内存是璶颈时。
 
   Args:
-    fn: a function that takes Tensors (all as positional arguments) and returns
-      a tuple of Tensors.
+    fn: 以 Tensors 为位置参数、返回 Tensors 元组的函数
 
   Returns:
-    A wrapped fn that is identical to fn when called, but its activations will
-    be discarded and recomputed on the backwards pass (i.e. on a call to
-    tf.gradients).
+    封装后的 fn，调用时行为与 fn 相同，但其激活将被丢弃并在反向传播时重新计算
   """
 
   @functools.wraps(fn)
@@ -3026,7 +3971,10 @@ def _recompute_grad(fn, args):
 
 
 def dense(x, units, **kwargs):
-  """Identical to layers.dense."""
+  """全连接层，功能与 tf.layers.dense 相同。
+  
+  对 layers().Dense(units) 的封装，额外支持 layer_collection 参数（用于 KFAC 优化器）。
+  """
   layer_collection = kwargs.pop("layer_collection", None)
   activations = layers().Dense(units, **kwargs)(x)
   if layer_collection:
@@ -3129,7 +4077,30 @@ def mix(x1,
         mode="lin",
         simple=False,
         broadcast_last=False):
-  """Mix starting with x2, mixing mixing, going towards x1."""
+  """渐进式混合：从 x2 开始，随训练步数增加逐渐向 x1 过渡。
+  
+  用于实现计划采样（Scheduled Sampling）或课程学习（Curriculum Learning）：
+  - 训练初期：主要使用 x2（如真实标签或简单输入）
+  - 训练后期：主要使用 x1（如模型预测或困难输入）
+  
+  混合模式：
+  - mode='lin'：使用线性衰减从 min_prob 到 max_prob 的混合概率
+  - mode='exp'：使用指数衰减
+  
+  Args:
+    x1: 目标张量（训练结束时主要使用的张量）
+    x2: 起始张量（训练开始时主要使用的张量）
+    steps: 完成混合过渡所需的训练步数
+    is_training: 是否在训练模式（推理时直接返回 x1 或随机混合）
+    min_prob: 混合中 x1 的最小概率
+    max_prob: 混合中 x1 的最大概率（1.0 表示训练结束时完全使用 x1）
+    mode: 概率增长模式，'lin'（线性）或 'exp'（指数）
+    simple: 如果为 True，使用简单的元素级线性插值而非随机掩码
+    broadcast_last: 如果为 True，在最后一维上广播混合 alpha
+  
+  Returns:
+    混合后的张量
+  """
   with tf.name_scope("mix"):
     if not is_training:
       if max_prob >= 1.0:
@@ -3177,7 +4148,20 @@ def mix(x1,
 
 
 def brelu(x):
-  """Bipolar ReLU as in https://arxiv.org/abs/1709.04054."""
+  """双极 ReLU（Bipolar ReLU），论文：https://arxiv.org/abs/1709.04054。
+  
+  将输入分为两半：
+  - 前半部分应用 ReLU（只保留正值）
+  - 后半部分应用 -ReLU(-x)（只保留负值，相当于倒置的 ReLU）
+  
+  这样的设计同时传递正值和负值信息，避免 ReLU 的单侧抑制。
+  
+  Args:
+    x: 输入张量
+    
+  Returns:
+    与 x 形状相同的张量
+  """
   x_shape = shape_list(x)
   x1, x2 = tf.split(tf.reshape(x, x_shape[:-1] + [-1, 2]), 2, axis=-1)
   y1 = tf.nn.relu(x1)
@@ -3186,7 +4170,20 @@ def brelu(x):
 
 
 def belu(x):
-  """Bipolar ELU as in https://arxiv.org/abs/1709.04054."""
+  """双极 ELU（Bipolar ELU），论文：https://arxiv.org/abs/1709.04054。
+  
+  与 brelu 类似，但使用 ELU 代替 ReLU：
+  - 前半部分应用 ELU（正值保留，负值平滑衰减到 -1）
+  - 后半部分应用 -ELU(-x)
+  
+  ELU 相比 ReLU 在负区间有梯度，减少死神经元问题。
+  
+  Args:
+    x: 输入张量
+    
+  Returns:
+    与 x 形状相同的张量
+  """
   x_shape = shape_list(x)
   x1, x2 = tf.split(tf.reshape(x, x_shape[:-1] + [-1, 2]), 2, axis=-1)
   y1 = tf.nn.elu(x1)
@@ -3195,16 +4192,25 @@ def belu(x):
 
 
 def gelu(x):
-  """Gaussian Error Linear Unit.
+  """高斯误差线性单元（Gaussian Error Linear Unit，GELU）激活函数。
 
-  This is a smoother version of the RELU.
-  Original paper: https://arxiv.org/abs/1606.08415
+  GELU 是 ReLU 的平滑版本，被 BERT、GPT 等大型语言模型广泛采用。
+  原始论文：https://arxiv.org/abs/1606.08415
+  
+  数学公式：GELU(x) = x * Φ(x)
+  其中 Φ(x) 是标准正态分布的累积分布函数（CDF），
+  近似公式：x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+  
+  与 ReLU 相比：
+  - 不是硬截断（不会突然置零），而是平滑地接近零
+  - 在负值区间也有小的梯度，不会产生死神经元
+  - 实验上在 Transformer 中通常表现比 ReLU 更好
 
   Args:
-    x: float Tensor to perform activation.
+    x: 浮点型张量
 
   Returns:
-    x with the GELU activation applied.
+    应用 GELU 激活后的张量，形状与 x 相同
   """
   cdf = 0.5 * (1.0 + tf.tanh(
       (np.sqrt(2 / np.pi) * (x + 0.044715 * tf.pow(x, 3)))))
@@ -3212,7 +4218,22 @@ def gelu(x):
 
 
 def nac(x, depth, name=None, reuse=None):
-  """NAC as in https://arxiv.org/abs/1808.00508."""
+  """神经累加器（Neural Accumulator，NAC），论文：https://arxiv.org/abs/1808.00508。
+  
+  NAC 设计用于处理数值运算（如加法、减法、计数）：
+  - 权重矩阵 W = tanh(W_hat) * sigmoid(M_hat)，将参数约束在 [-1, 1]
+  - 这种设计让模型学习精确的累加操作（整数加法等）
+  - 比普通线性层更适合需要数值运算的任务
+  
+  Args:
+    x: 输入张量
+    depth: 输出维度
+    name: 变量作用域名称
+    reuse: 是否重用变量
+    
+  Returns:
+    形状 [..., depth] 的输出张量
+  """
   with tf.variable_scope(name, default_name="nac", values=[x], reuse=reuse):
     x_shape = shape_list(x)
     w = tf.get_variable("w", [x_shape[-1], depth])
@@ -3224,7 +4245,26 @@ def nac(x, depth, name=None, reuse=None):
 
 
 def nalu(x, depth, epsilon=1e-30, name=None, reuse=None):
-  """NALU as in https://arxiv.org/abs/1808.00508."""
+  """神经算术逻辑单元（Neural Arithmetic Logic Unit，NALU），论文：https://arxiv.org/abs/1808.00508。
+  
+  NALU 扩展了 NAC，增加了乘法/除法运算能力：
+  - 加法/减法路径：a = NAC(x)（在实数空间进行累加）
+  - 乘法/除法路径：m = exp(NAC(log|x|))（在对数空间进行累加，等价于乘除法）
+  - 门控组合：output = g * a + (1-g) * m
+    其中 g = sigmoid(Dense(x)) 是学到的门控权重
+  
+  这样 NALU 可以同时学习加法和乘法等数值运算。
+  
+  Args:
+    x: 输入张量
+    depth: 输出维度
+    epsilon: 对数运算的数值稳定性参数（避免 log(0)）
+    name: 变量作用域名称
+    reuse: 是否重用变量
+    
+  Returns:
+    形状 [..., depth] 的输出张量
+  """
   with tf.variable_scope(name, default_name="nalu", values=[x], reuse=reuse):
     x_shape = shape_list(x)
     x_flat = tf.reshape(x, [-1, x_shape[-1]])
@@ -3238,7 +4278,19 @@ def nalu(x, depth, epsilon=1e-30, name=None, reuse=None):
 
 
 def argmax_with_score(logits, axis=None):
-  """Argmax along with the value."""
+  """同时返回 argmax 索引和对应的最大值分数。
+  
+  比单独调用 tf.argmax 再做 gather 更高效，常用于解码时获取预测结果和置信度。
+  
+  Args:
+    logits: 任意维度的张量，在最后一维或指定轴上取 argmax
+    axis: 求 argmax 的轴，默认为最后一维
+    
+  Returns:
+    (predictions, scores)：
+    - predictions：argmax 索引，形状比 logits 少一维
+    - scores：对应位置的最大值，形状与 predictions 相同
+  """
   axis = axis or len(logits.get_shape()) - 1
   predictions = tf.argmax(logits, axis=axis)
 
@@ -3264,6 +4316,18 @@ def argmax_with_score(logits, axis=None):
 
 
 def log_prob_from_logits(logits, reduce_axis=-1):
+  """从 logits 计算对数概率（log softmax）。
+  
+  log_prob = logits - log(sum(exp(logits)))
+  使用 logsumexp 计算数值稳定，避免大值 exp 溢出。
+  
+  Args:
+    logits: 任意形状的张量
+    reduce_axis: 对哪个轴做归一化（默认最后一维）
+    
+  Returns:
+    与 logits 形状相同的对数概率张量
+  """
   return logits - tf.reduce_logsumexp(logits, axis=reduce_axis, keepdims=True)
 
 
@@ -3355,10 +4419,14 @@ def index_last_dim_with_indices(x, indices):
 
 
 def should_generate_summaries():
-  """Is this an appropriate context to generate summaries.
+  """判断当前上下文是否适合生成 TensorBoard 摘要（Summaries）。
+  
+  有两种情况下不应生成摘要：
+  1. 在 tf.while_loop() 内部：摘要在循环中效果不好（会产生大量重复数据）
+  2. 在 variable_scope reuse=True 的情况下：避免为不同数据分片生成单独的摘要
 
   Returns:
-    a boolean
+    bool: True 表示应该生成摘要，False 表示跳过摘要生成
   """
   name_scope = contrib.framework().get_name_scope()
   if name_scope and "while/" in name_scope:
@@ -3371,7 +4439,17 @@ def should_generate_summaries():
 
 
 def reshape_like(a, b):
-  """Reshapes a to match the shape of b in all but the last dimension."""
+  """将 a reshape 成与 b 除最后一维外形状相同（最后一维保留 a 的维度）。
+  
+  常用于在保持最后一维（feature 维度）不变的情况下，调整前置维度。
+  
+  Args:
+    a: 需要 reshape 的张量
+    b: 提供目标形状（除最后一维）的参考张量
+    
+  Returns:
+    reshape 后的 a：前置维度与 b 匹配，最后一维与 a 的原始最后一维相同
+  """
   ret = tf.reshape(a, tf.concat([tf.shape(b)[:-1], tf.shape(a)[-1:]], 0))
   if not tf.executing_eagerly():
     ret.set_shape(b.get_shape().as_list()[:-1] + a.get_shape().as_list()[-1:])
@@ -3401,7 +4479,18 @@ def summarize_video(video, prefix, max_outputs=1):
 
 
 def cast_like(x, y):
-  """Cast x to y's dtype, if necessary."""
+  """将 x 的数据类型转换为与 y 相同（如果类型不同则进行转换）。
+  
+  在混合精度训练中常用，确保两个张量的数据类型一致。
+  如果已经相同则直接返回 x，避免不必要的转换操作。
+  
+  Args:
+    x: 需要转换类型的张量
+    y: 提供目标数据类型的参考张量
+    
+  Returns:
+    与 x 值相同但数据类型与 y 一致的张量
+  """
   x = tf.convert_to_tensor(x)
   y = tf.convert_to_tensor(y)
 
@@ -3421,7 +4510,20 @@ def cast_like(x, y):
 
 
 def make_even_size(x):
-  """Pad x to be even-sized on axis 1 and 2, but only if necessary."""
+  """将张量在第 1 和第 2 维度填充到偶数大小（仅在必要时填充）。
+  
+  某些卷积操作（如步幅为 2 的卷积）要求输入的空间维度为偶数。
+  此函数通过在末尾填充零来确保这一点，同时尽量不破坏静态形状。
+  
+  Args:
+    x: 至少 3 维的张量（如 [batch, height, width, channels]）
+    
+  Returns:
+    第 1 和第 2 维度被填充到偶数大小的张量
+    
+  Raises:
+    AssertionError: 如果张量维度不足 3
+  """
   x_shape = x.get_shape().as_list()
   assert len(x_shape) > 2, "Only 3+-dimensional tensors supported."
   shape = [dim if dim is not None else -1 for dim in x_shape]
@@ -3520,6 +4622,22 @@ def sliced_gan_loss(input1,
 
 
 def lrelu(input_, leak=0.2, name="lrelu"):
+  """Leaky ReLU（带泄漏的修正线性单元）激活函数。
+  
+  与标准 ReLU 不同，Leaky ReLU 在 x<0 时输出 leak * x 而不是 0：
+  - x >= 0：输出 x
+  - x < 0：输出 leak * x（保持小的负梯度，避免死神经元）
+  
+  常用于 GAN 的判别器中，为负值输入保留梯度信息。
+  
+  Args:
+    input_: 输入张量
+    leak: 负值区间的斜率（默认 0.2）
+    name: 操作名称
+    
+  Returns:
+    与输入形状相同的张量
+  """
   return tf.maximum(input_, leak * input_, name=name)
 
 
@@ -3530,7 +4648,25 @@ def deep_discriminator(x,
                        filter_size=4,
                        stride=2,
                        output_size=1024):
-  """Discriminator architecture based on InfoGAN."""
+  """基于 InfoGAN 结构的深度判别器（GAN 中用于区分真实和生成样本）。
+  
+  结构：
+  - Conv2D(filters, filter_size, stride=2) + Leaky ReLU  # 下采样
+  - Conv2D(2*filters, filter_size, stride=2) + BatchNorm + Leaky ReLU  # 进一步下采样
+  - Flatten -> Dense(output_size) + BatchNorm + Leaky ReLU  # 全连接
+  
+  Args:
+    x: 输入图像张量，形状 [batch, height, width, channels]
+    batch_norm: 是否使用批归一化
+    is_training: 是否在训练模式
+    filters: 基础卷积通道数
+    filter_size: 卷积核大小
+    stride: 卷积步幅（控制下采样率）
+    output_size: 最后全连接层的输出大小
+    
+  Returns:
+    判别器特征向量，形状 [batch, output_size]
+  """
   with tf.variable_scope(
       "discriminator", initializer=tf.random_normal_initializer(stddev=0.02)):
     batch_size, height, width = shape_list(x)[:3]  # pylint: disable=unbalanced-tuple-unpacking
@@ -3563,7 +4699,21 @@ def deep_discriminator(x,
 
 
 def instance_norm(x):
-  """Instance normalization layer."""
+  """实例归一化层（Instance Normalization）。
+  
+  与批归一化（Batch Norm）不同，实例归一化在每个样本的每个通道上独立计算均值和方差：
+  - 批归一化：在 batch 和空间维度上归一化（归一化跨样本统计）
+  - 实例归一化：只在空间维度（H, W）上归一化（每个样本独立）
+  
+  实例归一化在风格迁移（Style Transfer）和 CycleGAN 等任务中常用，
+  因为它可以将每个样本的风格信息归一化掉，只保留内容。
+  
+  Args:
+    x: 输入张量，形状 [batch, height, width, channels]
+    
+  Returns:
+    实例归一化后的张量，形状与 x 相同
+  """
   with tf.variable_scope("instance_norm"):
     epsilon = 1e-5
     mean, var = tf.nn.moments(x, [1, 2], keep_dims=True)
@@ -3587,7 +4737,28 @@ def general_conv(x,
                  do_norm="instance",
                  do_relu=True,
                  relufactor=0):
-  """Generalized convolution layer."""
+  """通用卷积层：卷积 + 可选归一化 + 可选激活（用于 CycleGAN 等图像生成网络）。
+  
+  这是一个用于图像生成网络的通用卷积块，封装了三个可选操作：
+  1. 卷积：标准 Conv2D，可指定卷积核大小、步幅和填充方式
+  2. 归一化：支持 'layer'（层归一化）、'instance'（实例归一化）或不归一化
+  3. 激活：支持 ReLU、Leaky ReLU 或不激活
+  
+  Args:
+    x: 输入张量
+    num_filters: 卷积输出通道数
+    filter_size: 卷积核大小
+    stride: 卷积步幅
+    stddev: 卷积核初始化标准差
+    padding: 填充方式
+    name: 变量作用域名称
+    do_norm: 归一化类型，'layer'（层归一化）、'instance'（实例归一化）或 False（不归一化）
+    do_relu: 是否应用激活函数
+    relufactor: Leaky ReLU 的负斜率（0 表示使用标准 ReLU）
+    
+  Returns:
+    卷积块输出张量
+  """
   with tf.variable_scope(name):
     x = layers().Conv2D(
         num_filters,
@@ -3613,7 +4784,26 @@ def general_conv(x,
 
 def patch_discriminator(x, filters=64, filter_size=5, n=4,
                         name="patch_discrim"):
-  """Patch descriminator."""
+  """PatchGAN 判别器（对图像的随机补丁进行判别）。
+  
+  PatchGAN 不判断整张图像是真实还是生成的，而是在随机裁剪的图像补丁上进行判别。
+  这样可以捕获局部纹理细节，比全局判别器更适合图像翻译任务（如 CycleGAN）。
+  
+  结构：
+  - 先将输入随机裁剪到 1/4 大小（height/4, width/4）
+  - 然后应用 n 层 general_conv（逐层增加通道数：filters, 2*filters, 4*filters, ...）
+  - 最后在空间维度上取均值
+  
+  Args:
+    x: 输入张量，形状 [batch, height, width, channels]
+    filters: 基础卷积通道数
+    filter_size: 卷积核大小
+    n: 卷积层数
+    name: 变量作用域名称
+    
+  Returns:
+    形状 [batch] 的判别分数
+  """
   with tf.variable_scope(name):
     x_shape = shape_list(x)
     spatial_dims = [x_shape[1] // 4, x_shape[2] // 4]
@@ -3635,7 +4825,23 @@ def patch_discriminator(x, filters=64, filter_size=5, n=4,
 
 
 def mean_with_attention(x, name, num_heads=4):
-  """Mean and attention to reduce spatial dimensions."""
+  """使用均值和注意力加权求和来压缩空间维度。
+  
+  同时计算：
+  1. 全局均值池化（global mean pooling）
+  2. 多头注意力加权求和（weighted sum with learned attention weights）
+  然后将两者拼接后通过线性层输出。
+  
+  这比单纯的全局均值池化更好，因为注意力机制可以学习对重要区域赋予更高权重。
+  
+  Args:
+    x: 输入张量，形状 [batch, height, width, channels]
+    name: 变量作用域名称
+    num_heads: 注意力头数
+    
+  Returns:
+    形状 [batch, 2*channels] 的输出张量（均值特征 + 注意力特征的拼接）
+  """
   with tf.variable_scope(name):
     shape = shape_list(x)
     m = tf.reduce_mean(x, [1, 2])
@@ -3651,7 +4857,22 @@ def mean_with_attention(x, name, num_heads=4):
 
 def single_discriminator(x, filters=128, kernel_size=8,
                          strides=4, pure_mean=False):
-  """A simple single-layer convolutional discriminator."""
+  """简单的单层卷积判别器（GAN 中区分真实和生成样本）。
+  
+  结构：
+  - Conv2D(filters, kernel_size, strides)：提取特征
+  - 空间压缩：全局均值或 mean_with_attention
+  
+  Args:
+    x: 输入张量，形状 [batch, height, width, channels]
+    filters: 卷积通道数
+    kernel_size: 卷积核大小
+    strides: 卷积步幅（控制下采样率）
+    pure_mean: True 时使用简单均值池化，False 时使用注意力加权均值
+    
+  Returns:
+    形状 [batch, ?] 的判别特征向量
+  """
   with tf.variable_scope("discriminator"):
     net = layers().Conv2D(
         filters, kernel_size, strides=strides, padding="SAME", name="conv1")(x)
@@ -3664,7 +4885,24 @@ def single_discriminator(x, filters=128, kernel_size=8,
 
 def double_discriminator(x, filters1=128, filters2=None,
                          kernel_size=8, strides=4, pure_mean=False):
-  """A convolutional discriminator with 2 layers and concatenated output."""
+  """两层卷积判别器，拼接两层的特征输出。
+  
+  比 single_discriminator 提取更丰富的特征：
+  - 第一层提取低级特征，通过空间压缩得到 net1
+  - 第二层（在第一层基础上）提取高级特征，通过空间压缩得到 net2
+  - 拼接 net1 和 net2 输出，提供多尺度的特征表示
+  
+  Args:
+    x: 输入张量，形状 [batch, height, width, channels]
+    filters1: 第一层卷积通道数
+    filters2: 第二层卷积通道数（默认为 4*filters1）
+    kernel_size: 卷积核大小
+    strides: 卷积步幅（控制下采样率）
+    pure_mean: True 时使用简单均值池化，False 时使用注意力加权均值
+    
+  Returns:
+    形状 [batch, ?] 的拼接判别特征向量（包含两层特征）
+  """
   if filters2 is None:
     filters2 = 4 * filters1
   with tf.variable_scope("discriminator"):
@@ -3688,12 +4926,33 @@ def double_discriminator(x, filters1=128, filters2=None,
 
 
 def upscale(inputs, f, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR):
-  """Upscaling the image by a factor of f."""
+  """将图像在高度和宽度维度上放大 f 倍。
+  
+  Args:
+    inputs: 输入张量，形状 [batch, height, width, channels]
+    f: 放大倍数（整数）
+    method: 插值方式（默认最近邻插值，也可使用双线性插值等）
+    
+  Returns:
+    放大后的张量，形状 [batch, height*f, width*f, channels]
+  """
   height, width = shape_list(inputs)[1:3]  # pylint: disable=unbalanced-tuple-unpacking
   return tf.image.resize_images(inputs, (height * f, width * f), method)
 
 
 def tpu_safe_image_summary(image):
+  """将图像转换为适合在 TensorBoard 摘要中显示的格式（TPU 兼容版本）。
+  
+  TPU 上的 TensorBoard 摘要只支持 float32 类型的图像，
+  而 CPU/GPU 上的 tf.summary.image 通常期望 uint8 类型。
+  此函数根据环境选择合适的格式。
+  
+  Args:
+    image: 图像张量
+    
+  Returns:
+    转换后的图像张量（TPU 上为 float32，否则为 uint8）
+  """
   if is_xla_compiled():
     # We only support float32 images at the moment due to casting complications.
     if image.dtype != tf.float32:
@@ -3768,7 +5027,23 @@ def cyclegan_upsample(net, num_outputs, stride, method="conv2d_transpose"):
 
 
 def weight_targeting(w, k):
-  """Weight-level magnitude pruning."""
+  """权重级别的幅度剪枝（Weight-level Magnitude Pruning）。
+  
+  对于每个输出单元，找出幅度最小的 k 个权重连接，并返回一个掩码：
+  - 掩码为 0：对应的连接是目标（最小的 k 个），可能被剪枝
+  - 掩码为 1：对应的连接不是目标
+  
+  与 unit_targeting 的区别：
+  - weight_targeting：逐个权重排序（更细粒度）
+  - unit_targeting：逐个输出单元排序（以整个神经元为单位）
+  
+  Args:
+    w: 权重张量，最后一维为输出维度
+    k: 每个输出单元中目标的权重数量
+    
+  Returns:
+    与 w 形状相同的浮点掩码张量（1.0 表示非目标，0.0 表示目标）
+  """
   k = tf.to_int32(k)
   w_shape = shape_list(w)
   size = tf.to_int32(tf.reduce_prod(w_shape[:-1]))
@@ -3782,7 +5057,21 @@ def weight_targeting(w, k):
 
 
 def unit_targeting(w, k):
-  """Unit-level magnitude pruning."""
+  """单元级别的幅度剪枝（Unit-level Magnitude Pruning）。
+  
+  对所有输出单元按 L2 范数排序，找出范数最小的 k 个单元，并返回掩码：
+  - 掩码为 0：对应的单元是目标（最小的 k 个），可能被剪枝
+  - 掩码为 1：对应的单元不是目标
+  
+  与 weight_targeting 相比，这里以整个输出神经元为单位进行剪枝（结构化剪枝）。
+  
+  Args:
+    w: 权重张量，最后一维为输出维度
+    k: 目标（剪枝）的输出单元数量
+    
+  Returns:
+    与 w 形状相同的浮点掩码张量（1.0 表示非目标，0.0 表示目标）
+  """
   k = tf.to_int32(k)
   w_shape = shape_list(w)
   size = tf.to_int32(tf.reduce_prod(w_shape[:-1]))
@@ -3814,7 +5103,38 @@ def td_conv(inputs,
             bias_initializer=tf.zeros_initializer(),
             name=None,
             reuse=None):
-  """Apply targeted dropout to the weights of a convolution."""
+  """带目标 Dropout 的卷积层（Targeted Dropout Convolution）。
+  
+  目标 Dropout 对权重中最小幅度的部分应用 Dropout，
+  训练过程中自动识别并压制不重要的权重，使剪枝后的模型性能损失更小。
+  
+  参考论文：'Targeted Dropout for Posthoc Pruning'
+  Aidan N. Gomez, Ivan Zhang, Kevin Swersky, Yarin Gal, and Geoffrey E. Hinton.
+  
+  Args:
+    inputs: 输入张量
+    filters: 卷积输出通道数
+    kernel_size: 卷积核大小（整数）
+    targeting_count: 每次 dropout 目标的权重数量（传给 targeting_fn）
+    targeting_fn: 选择目标权重的函数，格式 fn(weights, k) -> bool mask
+      返回 True 表示该权重被目标（将被 dropout）
+    keep_prob: 被目标权重的保留概率（1.0 表示不丢弃）
+    is_training: 是否在训练模式
+    do_prune: 是否在推理时进行硬剪枝（将目标权重永久置零）
+    strides: 卷积步幅
+    padding: 填充方式
+    data_format: 数据格式，'channels_last'（NHWC）或 'channels_first'（NCHW）
+    dilation_rate: 膨胀率
+    activation: 可选激活函数
+    use_bias: 是否使用偏置
+    kernel_initializer: 卷积核初始化器
+    bias_initializer: 偏置初始化器
+    name: 变量作用域名称
+    reuse: 是否重用变量
+    
+  Returns:
+    卷积输出张量
+  """
   with tf.variable_scope(name, default_name="td_conv", reuse=reuse):
     nhwc = data_format == "channels_last"
     in_dim = shape_list(inputs)[-1] if nhwc else shape_list(inputs)[1]
@@ -3909,15 +5229,25 @@ def targeted_dropout(inputs,
 
 
 def kl_divergence(mu, log_var, mu_p=0.0, log_var_p=0.0):
-  """KL divergence of diagonal gaussian N(mu,exp(log_var)) and N(0,1).
+  """计算对角高斯分布 N(mu, exp(log_var)) 相对于先验分布的 KL 散度。
+  
+  KL 散度（Kullback-Leibler Divergence）用于变分自编码器（VAE）的正则化损失：
+  - 后验分布：N(mu, exp(log_var))
+  - 先验分布：N(mu_p, exp(log_var_p))，默认为标准正态 N(0, 1)
+  
+  KL(q||p) = 期望 q 对 log(q/p) 的积分，对角高斯分布有解析解。
+  
+  这个损失促使编码器输出接近先验分布，实现了 VAE 的潜在空间正则化，
+  使潜在空间连续且有意义，可以从中采样生成新样本。
 
   Args:
-    mu: mu parameter of the distribution.
-    log_var: log(var) parameter of the distribution.
-    mu_p: optional mu from a learned prior distribution
-    log_var_p: optional log(var) from a learned prior distribution
+    mu: 后验分布的均值参数，形状 [batch, latent_dim]
+    log_var: 后验分布的对数方差，形状 [batch, latent_dim]
+    mu_p: 先验分布的均值（默认 0.0）
+    log_var_p: 先验分布的对数方差（默认 0.0，即方差为 1）
+    
   Returns:
-    the KL loss.
+    标量 KL 散度损失（对 batch 取均值后对所有维度求和）
   """
 
   batch_size = shape_list(mu)[0]
@@ -3931,6 +5261,15 @@ def kl_divergence(mu, log_var, mu_p=0.0, log_var_p=0.0):
 
 
 def sparse_equals_constant(constant, tensor):
+  """判断稀疏张量的每个非零值是否等于指定常量。
+  
+  Args:
+    constant: 比较的目标常量值
+    tensor: 稀疏张量（SparseTensor）
+    
+  Returns:
+    与 tensor 结构相同的稀疏布尔张量（values 为比较结果）
+  """
   return tf.SparseTensor(
       indices=tensor.indices,
       dense_shape=tensor.dense_shape,
@@ -3938,6 +5277,18 @@ def sparse_equals_constant(constant, tensor):
 
 
 def sparse_expand_dims(tensor, current_num_dims, axis=0):
+  """在稀疏张量的指定位置插入大小为 1 的新维度。
+  
+  等价于稀疏张量版本的 tf.expand_dims。
+  
+  Args:
+    tensor: 稀疏张量（SparseTensor）
+    current_num_dims: 当前张量的维度数
+    axis: 插入新维度的位置（0 表示最前面，-1 表示最后面）
+    
+  Returns:
+    在指定位置插入新维度后的稀疏张量
+  """
   if axis == -1:
     axis = current_num_dims
 
@@ -3952,6 +5303,15 @@ def sparse_expand_dims(tensor, current_num_dims, axis=0):
 
 
 def sparse_add_constant(constant, tensor):
+  """将常量加到稀疏张量的每个非零值上。
+  
+  Args:
+    constant: 要加的常量值
+    tensor: 稀疏张量（SparseTensor）
+    
+  Returns:
+    值加上常量后的稀疏张量（结构不变）
+  """
   return tf.SparseTensor(
       indices=tensor.indices,
       values=constant + tensor.values,
@@ -3959,6 +5319,16 @@ def sparse_add_constant(constant, tensor):
 
 
 def sparse_eye(size):
+  """创建稀疏单位矩阵（对角线为 1，其余为 0）。
+  
+  使用稀疏表示（只存储对角线上的 size 个非零元素），内存效率高。
+  
+  Args:
+    size: 矩阵大小（size × size 的方阵）
+    
+  Returns:
+    size × size 的稀疏单位矩阵（SparseTensor）
+  """
   indices = tf.cast(tf.stack([tf.range(size), tf.range(size)]), tf.int64)
   values = tf.ones(size)
   dense_shape = [tf.cast(size, tf.int64), tf.cast(size, tf.int64)]
