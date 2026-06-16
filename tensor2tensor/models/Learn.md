@@ -69,6 +69,7 @@ tensor2tensor/
 **文件**：`layers/common_attention.py`
 
 这是整个代码库最核心的函数。理解它等于理解了论文第 3.2 节。
+`Ps：4901行是核心代码的开始`
 
 关键流程：
 ```

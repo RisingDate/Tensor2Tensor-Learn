@@ -1511,27 +1511,28 @@ def layer_prepostprocess(previous_value,
 
 
 def layer_preprocess(layer_input, hparams, layer_collection=None):
-  """Apply layer preprocessing.
+  """对层输入执行预处理操作（归一化、Dropout 等）。
 
-  See layer_prepostprocess() for details.
+  是 layer_prepostprocess() 的封装，从 hparams 中读取预处理参数。
+  详细说明见 layer_prepostprocess()。
 
-  A hyperparameters object is passed for convenience.  The hyperparameters
-  that may be used are:
+  注意：预处理序列中不允许包含残差连接（'a' 和 'z' 字符），
+  因为残差连接应该在后处理中完成。
 
-    layer_preprocess_sequence
-    layer_prepostprocess_dropout
-    norm_type
-    hidden_size
-    norm_epsilon
+  相关超参数：
+    layer_preprocess_sequence:  预处理操作序列（如 "n" 表示仅归一化）
+    layer_prepostprocess_dropout: dropout 比率
+    norm_type: 归一化类型（layer/batch 等）
+    hidden_size: 隐藏层大小（用于 batch norm）
+    norm_epsilon: 归一化中的数值稳定项
 
   Args:
-    layer_input: a Tensor
-    hparams: a hyperparameters object.
-    layer_collection: A tensorflow_kfac.LayerCollection. Only used by the
-      KFAC optimizer. Default is None.
+    layer_input: 输入张量（Tensor）
+    hparams: 超参数对象
+    layer_collection: tensorflow_kfac.LayerCollection，仅 KFAC 优化器使用，默认 None
 
   Returns:
-    a Tensor
+    预处理后的张量
   """
   assert "a" not in hparams.layer_preprocess_sequence, (
       "No residual connections allowed in hparams.layer_preprocess_sequence")
@@ -1552,26 +1553,29 @@ def layer_preprocess(layer_input, hparams, layer_collection=None):
 
 
 def layer_postprocess(layer_input, layer_output, hparams):
-  """Apply layer postprocessing.
+  """对层输出执行后处理操作（残差连接、归一化、Dropout 等）。
 
-  See layer_prepostprocess() for details.
+  是 layer_prepostprocess() 的封装，从 hparams 中读取后处理参数。
+  详细说明见 layer_prepostprocess()。
 
-  A hyperparameters object is passed for convenience.  The hyperparameters
-  that may be used are:
+  典型的 Transformer 后处理序列（hparams.layer_postprocess_sequence）：
+  - "da"：先 Dropout，再残差连接（将 layer_output 与 layer_input 相加）
+  - "dan"：先 Dropout，再残差连接，再层归一化
 
-    layer_postprocess_sequence
-    layer_prepostprocess_dropout
-    norm_type
-    hidden_size
-    norm_epsilon
+  相关超参数：
+    layer_postprocess_sequence: 后处理操作序列（如 "da"）
+    layer_prepostprocess_dropout: dropout 比率
+    norm_type: 归一化类型
+    hidden_size: 隐藏层大小
+    norm_epsilon: 归一化中的数值稳定项
 
   Args:
-    layer_input: a Tensor
-    layer_output: a Tensor
-    hparams: a hyperparameters object.
+    layer_input: 子层的原始输入张量（用于残差连接）
+    layer_output: 子层的输出张量
+    hparams: 超参数对象
 
   Returns:
-    a Tensor
+    后处理后的张量
   """
   return layer_prepostprocess(
       layer_input,
@@ -2318,15 +2322,27 @@ def conv_gru(x,
 
 
 def gru_feedfwd(a_t, h_prev, filters, name=None):
-  """position-wise Feed-fwd GRU gates following the MPNN.
+  """逐位置的 GRU 前馈门控，参照消息传递神经网络（MPNN）的设计。
+
+  GRU（门控循环单元）的简化版前馈实现，去掉了序列维度上的循环依赖，
+  使其可以并行计算。每个位置独立地执行 GRU 门控操作。
+
+  GRU 更新公式：
+    z_t = sigmoid(W_z * a_t + U_z * h_prev)  # 更新门：控制有多少历史信息保留
+    r_t = sigmoid(W_r * a_t + U_r * h_prev)  # 重置门：控制历史信息的忘记程度
+    h_tilde = tanh(W * a_t + U * (r_t * h_prev))  # 候选隐藏状态
+    h_t = (1 - z_t) * h_prev + z_t * h_tilde  # 最终隐藏状态
+
+  使用右矩阵乘法（tpu_conv1d）来支持批量运算。
 
   Args:
-    a_t: Tensor of shape [batch, length, depth] of current input
-    h_prev: Tensor of shape [batch, length, depth] of prev input
-    filters: an integer specifying number of dimensions of the filters
-    name: A string
+    a_t: 当前输入张量，形状 [batch, length, depth]
+    h_prev: 前一时刻的隐藏状态，形状 [batch, length, depth]
+    filters: 输出维度大小（GRU 隐藏单元数）
+    name: 变量作用域名称（可选）
+
   Returns:
-    h_t: [batch, length, filters] hidden state
+    h_t: 更新后的隐藏状态，形状 [batch, length, filters]
   """
 
   with tf.variable_scope(name, default_name="GRU", values=[a_t, h_prev]):
@@ -2797,7 +2813,25 @@ def split_to_discretized_mix_logistic_params(inputs):
 
 
 def discretized_mix_logistic_loss(pred, labels):
-  """Computes negative log probability for the discretized mixture of logistics.
+  """计算离散化 Logistic 混合分布的负对数似然损失（用于图像像素建模）。
+
+  这是 PixelCNN++ 论文中使用的损失函数，将每个像素建模为 K 个离散 Logistic
+  分布的混合模型。相比于交叉熵，此损失更适合图像生成任务，因为它：
+  1. 考虑了像素值的连续性（相邻值更相似）
+  2. 使用通道间的线性相关性（means 由前一通道线性参数化）
+  3. 对边界值（0 和 255）进行特殊处理
+
+  整体像素分布建模为混合 3 维离散 Logistic 分布：
+  ```
+  P(X = x) = sum_{k=1}^K probs[k] * prod_{c=1}^3 DiscretizedLogistic(X[c]=x[c])
+  ```
+
+  其中 means 是前一通道值的线性组合：
+    means_0 = locs[0]
+    means_1 = locs[1] + coeffs[0] * x[0]
+    means_2 = locs[2] + coeffs[1] * x[0] + coeffs[2] * x[1]
+
+  Computes negative log probability for the discretized mixture of logistics.
 
   The distribution of a whole pixel is a mixture of 3-dimensional discretized
   logistic distributions. The 3-D discretized logistic factorizes as 3 1-D
@@ -3398,6 +3432,20 @@ class FactoredTensor(object):
 
 
 def _convert_factored_tensor_to_tensor(value, *args, **kwargs):
+  """将 FactoredTensor 转换为普通 Tensor（用于 TensorFlow 类型转换注册）。
+
+  当 TensorFlow 需要将 FactoredTensor 转换为普通 Tensor 时（例如在图操作中），
+  会调用此函数。它调用 FactoredTensor 的 to_tensor() 方法，先计算矩阵乘积
+  得到完整的 logits 矩阵，再进行类型转换。
+
+  Args:
+    value: 要转换的 FactoredTensor 对象
+    *args: 传递给 ops.convert_to_tensor 的位置参数
+    **kwargs: 传递给 ops.convert_to_tensor 的关键字参数（如 dtype）
+
+  Returns:
+    普通的 TensorFlow Tensor
+  """
   # call ops.convert_to_tensor to handle optional arguments appropriately
   return ops.convert_to_tensor(value.to_tensor(), *args, **kwargs)
 
@@ -3407,7 +3455,24 @@ tf.register_tensor_conversion_function(FactoredTensor,
 
 
 def smoothing_cross_entropy_factored_grad(op, dy):
-  """Gradient function for smoothing_cross_entropy_factored."""
+  """smoothing_cross_entropy_factored 的手动梯度函数（内存高效实现）。
+
+  为了避免一次性将完整的 logits 矩阵（大小为 [batch, vocab_size]）实体化，
+  此梯度函数将计算分为 num_splits=16 个块，每次只处理一小部分，
+  然后将各部分的梯度累加。
+
+  前向计算：logits = matmul(a, b.T)，即 a 是激活值，b 是词嵌入矩阵
+  反向计算：
+    grad_a[i] = 对第 i 块激活值的梯度
+    grad_b = 对词嵌入矩阵的梯度（累加所有块的贡献）
+
+  Args:
+    op: TensorFlow 操作对象，包含前向传播的输入 (a, b, labels, confidence)
+    dy: 来自上游的梯度张量
+
+  Returns:
+    关于 (a, b, labels, confidence) 的梯度元组，labels 和 confidence 的梯度为 None
+  """
   a = op.inputs[0]
   b = op.inputs[1]
   labels = op.inputs[2]
@@ -3539,19 +3604,26 @@ def fn_with_custom_grad(grad_fn, use_global_vars=False):
 
 
 def _fn_with_custom_grad(fn, inputs, grad_fn, use_global_vars=False):
-  """Create a subgraph with a custom gradient.
+  """创建一个具有自定义梯度的子图。
+
+  这是 TensorFlow 自定义梯度的底层实现机制。通过 @function.Defun 装饰器，
+  将前向计算包装为一个恒等函数（只传递输出），但绑定了自定义的反向传播函数。
+
+  工作原理：
+  1. 执行 fn(*inputs) 得到输出，同时记录创建的变量
+  2. 构建一个「恒等」Defun，其输入包含：原始输入、变量、输出
+  3. 在该 Defun 的梯度函数中，调用用户提供的 grad_fn 计算梯度
+  4. 这样可以完全控制反向传播行为（如实现梯度检查点、内存高效计算等）
 
   Args:
-    fn: function that takes inputs as arguments and produces 1 or more Tensors.
-    inputs: list<Tensor>, will be passed as fn(*inputs).
-    grad_fn: function with signature
-      (inputs, vars, outputs, output_grads) -> (grad_inputs, grad_vars),
-      all of which are lists of Tensors.
-    use_global_vars: if True, variables will be the global variables created.
-      If False, will be the trainable variables.
+    fn: 函数，接受 inputs 作为参数，返回一个或多个 Tensor
+    inputs: Tensor 列表，将以 fn(*inputs) 的方式调用
+    grad_fn: 梯度函数，签名为 (inputs, vars, outputs, output_grads) -> (grad_inputs, grad_vars)
+             所有参数和返回值都是 Tensor 列表
+    use_global_vars: 如果为 True，使用全局变量；否则使用可训练变量
 
   Returns:
-    fn(*inputs)
+    fn(*inputs) 的计算结果（但梯度由 grad_fn 控制）
   """
   vs = tf.get_variable_scope()
   get_vars_fn = (
@@ -3933,7 +4005,29 @@ def recompute_grad(fn):
 
 
 def _recompute_grad(fn, args):
-  """See recompute_grad."""
+  """梯度检查点的核心实现（参见 recompute_grad 装饰器）。
+
+  在反向传播时重新计算前向激活值，而不是将其保存在内存中。
+  这是经典的「计算换内存」技术，可以训练更深的网络：
+  - 前向传播：正常计算并丢弃中间激活值
+  - 反向传播：在需要激活值时，重新执行前向计算获取激活值，然后计算梯度
+
+  实现细节：
+  1. 缓存变量作用域（cached_vs）和参数作用域（cached_arg_scope），
+     以便在反向传播时使用 reuse=True 重新创建相同的计算图
+  2. 使用 _fn_with_custom_grad 注入自定义梯度函数 grad_fn
+  3. grad_fn 中使用 tf.control_dependencies(output_grads) 确保
+     重新计算在需要时才执行，避免不必要的计算
+
+  注意：bfloat16 输入时，变量梯度也会被转换为 bfloat16。
+
+  Args:
+    fn: 需要梯度检查点的函数
+    args: fn 的输入参数列表
+
+  Returns:
+    fn(*args) 的结果，但使用了激活值重计算的梯度
+  """
 
   cached_vs = []
   cached_arg_scope = []
@@ -4020,7 +4114,14 @@ def batch_dense(inputs,
                 kernel_initializer=None,
                 reuse=None,
                 name=None):
-  """Multiply a batch of input matrices by a batch of parameter matrices.
+  """对一批输入矩阵分别乘以对应的参数矩阵（用于混合专家网络 MoE）。
+
+  与普通全连接层不同，每个 batch 元素使用独立的参数矩阵。
+  这在混合专家（Mixture of Experts）中非常有用：
+  - batch 维度代表不同的专家，每个专家有自己独立的输入和参数
+  - 实现为 [batch, input_units, units] 的 3D 权重张量，用 tf.matmul 批量计算
+
+  Multiply a batch of input matrices by a batch of parameter matrices.
 
   Each input matrix is multiplied by the corresponding parameter matrix.
 
@@ -4028,19 +4129,18 @@ def batch_dense(inputs,
   experts with different inputs.
 
   Args:
-    inputs: a Tensor with shape [batch, length, input_units]
-    units: an integer
-    activation: an optional activation function to apply to the output
-    kernel_initializer: an optional initializer
-    reuse: whether to reuse the varaible scope
-    name: an optional string
+    inputs: 形状为 [batch, length, input_units] 的张量
+    units: 输出维度大小
+    activation: 可选的激活函数
+    kernel_initializer: 可选的权重初始化器
+    reuse: 是否复用变量作用域
+    name: 变量作用域名称（可选）
 
   Returns:
-    a Tensor with shape [batch, length, units]
+    形状为 [batch, length, units] 的张量
 
   Raises:
-    ValueError: if the "batch" or "input_units" dimensions of inputs are not
-      statically known.
+    ValueError: 如果 inputs 的 batch 或 input_units 维度无法静态确定
   """
   inputs_shape = shape_list(inputs)
   if len(inputs_shape) != 3:
@@ -4332,19 +4432,26 @@ def log_prob_from_logits(logits, reduce_axis=-1):
 
 
 def top_kth_iterative(x, k):
-  """Compute the k-th top element of x on the last axis iteratively.
+  """迭代式地计算 x 最后一轴上第 k 大的元素（TPU 友好实现）。
+
+  算法思路：连续 k-1 次迭代源除当前最大值，剩下的元素中的最大值就是第 k 大的元素。
+  通过 tf.foldl 将循环展开到 TF 计算图中，避免 Python 循环。
+
+  注意：要求 x 中的值为非负数（若有负数请先缩放）；不支持反向传播（内部调用了 tf.stop_gradient）。
+  对于小 k（尤其 k < 30），通常比 tf.nn.top_k 更快。
+
+  Compute the k-th top element of x on the last axis iteratively.
 
   This assumes values in x are non-negative, rescale if needed.
   It is often faster than tf.nn.top_k for small k, especially if k < 30.
   Note: this does not support back-propagation, it stops gradients!
 
   Args:
-    x: a Tensor of non-negative numbers of type float.
-    k: a python integer.
+    x: float 类型的非负数张量
+    k: Python 整数，表示要找第几大的元素
 
   Returns:
-    a float tensor of the same shape as x but with 1 on the last axis
-    that contains the k-th largest number in x.
+    与 x 形状相同的张量，最后一个轴大小为 1，包含第 k 大的值
   """
   # The iterative computation is as follows:
   #
@@ -4365,16 +4472,25 @@ def top_kth_iterative(x, k):
 
 
 def top_1_tpu(inputs):
-  """find max and argmax over the last dimension.
+  """在最后一个维度上找到最大元素及其索引（TPU 高效实现）。
+
+  替代 tf.argmax，在 TPU 上运行较好。
+  实现原理：
+  1. 找到最大值 inputs_max
+  2. 创建掌 mask，将等于最大元素的位置标为 1
+  3. 将 mask 与索引相乘，再用 reduce_max 得到 argmax
+  （这种方法在 TPU 上比 tf.argmax 更高效）
+
+  find max and argmax over the last dimension.
 
   Works well on TPU
 
   Args:
-    inputs: A tensor with shape [..., depth]
+    inputs: 形状为 [..., depth] 的张量
 
   Returns:
-    values: a Tensor with shape [...]
-    indices: a Tensor with shape [...]
+    values: 形状为 [...] 的张量，最后一维的最大元素值
+    indices: 形状为 [...] 的张量，最大元素的索引
   """
   inputs_max = tf.reduce_max(inputs, axis=-1, keepdims=True)
   mask = tf.to_int32(tf.equal(inputs_max, inputs))
@@ -4383,19 +4499,26 @@ def top_1_tpu(inputs):
 
 
 def index_last_dim_with_indices(x, indices):
-  """Use indices to index into the last axis of x.
+  """使用 indices 对 x 的最后一个轴进行索引（类似套索引操作）。
+
+  典型用途：从概率分布中获取采样对应的实际概率。
+  例如 x 形状为 [batch, vocab_size]，indices 形状为 [batch]，
+  返回结果为 [batch]，包含每个样本对应索引的概率值。
+
+  实现通过 tf.gather_nd 实现：先将张量压平到 0 至 n-1 维，
+  然后用 [flat_idx, index] 二元组进行 gather，最后再还原形状。
+
+  Use indices to index into the last axis of x.
 
   This can be useful for recovering the actual probabilities of a sample from a
   probability distribution.
 
   Args:
-    x: Tensor, n-d.
-    indices: Tensor, (n-1)-d, where the dimension sizes match the first (n-1)
-      dimensions of x. The values of indices will be used to index into the last
-      axis of x.
+    x: n 维张量
+    indices: (n-1) 维张量，尺寸与 x 的前 n-1 个维度匹配，元素值为 x 最后一轴的索引
 
   Returns:
-    Tensor, (n-1)-d.
+    (n-1) 维张量，包含对应索引位置的元素值
   """
   assert len(x.shape) == len(indices.shape) + 1
 
@@ -4457,7 +4580,20 @@ def reshape_like(a, b):
 
 
 def summarize_video(video, prefix, max_outputs=1):
-  """Summarize the video using image summaries starting with prefix."""
+  """将视频张量作为图像摘要（Summaries）添加到 TensorBoard 中。
+
+  将 5D 视频张量按帧拆分为多个 4D 图像张量，然后添加为图像摘要。
+  - 如果时间维度未知则只添加最后一帧
+  - 如果时间维度已知则添加每一帧，帧名为 "{prefix}_frame_{k}"
+  - Eager 模式下直接返回（TensorBoard 摘要仅在图模式下有效）
+
+  Summarize the video using image summaries starting with prefix.
+
+  Args:
+    video: 5D 张量，形状为 [batch, time, height, width, channels]
+    prefix: TensorBoard 摘要的名称前缀
+    max_outputs: TensorBoard 中显示的最大样本数，默认 1
+  """
   video_shape = shape_list(video)
   if len(video_shape) != 5:
     raise ValueError("Assuming videos given as tensors in the format "
@@ -4555,7 +4691,17 @@ def sliced_gan_loss(input1,
                     do_random_vecs=True,
                     do_tanh=True,
                     return_logits=False):
-  """Loss inspired by the sliced WGAN paper: https://arxiv.org/abs/1804.01947.
+  """基于切片 WGAN 的生成器损失（参考 arXiv:1804.01947）。
+
+  切片 WGAN（Sliced Wasserstein GAN）通过随机投影来近似 Wasserstein 距离：
+  1. 将判别器 logits 投影到 num_vecs 个随机方向（如果 do_random_vecs=True）
+  2. 将投影结果按批次序排序
+  3. 计算两个分布排序投影之间的 L2 损失
+  这个损失近似了两个分布之间的 Wasserstein 距离，避免了标准 GAN 训练不稳定的问题。
+
+  注意：判别器应该最大化这个损失（生成器最小化）。
+
+  Loss inspired by the sliced WGAN paper: https://arxiv.org/abs/1804.01947.
 
   Puts input1 and input2 through the provided discriminator to get logits.
   Then, computes num_vecs random projections of the logits, sorts them on
@@ -4971,23 +5117,29 @@ def tpu_safe_image_summary(image):
 # Therefore copying and forgoing any more bugfixes into it is the most
 # expedient way to use this function.
 def cyclegan_upsample(net, num_outputs, stride, method="conv2d_transpose"):
-  """Upsamples the given inputs.
+  """CycleGAN 中使用的上采样操作（支持多种方法）。
+
+  三种上采样方法：
+  - 'nn_upsample_conv'：最近邻插值 + 卷积（格栅锦式伪影较少）
+  - 'bilinear_upsample_conv'：双线性插值 + 卷积（较平滑）
+  - 'conv2d_transpose'：转置卷积（默认，格栅锦式伪影驱动）
+
+  该函数从 TensorFlow models 的 CycleGAN 实现库复制而来，
+  以避免对整个 models 库的依赖。
+
+  Upsamples the given inputs.
 
   Args:
-    net: A Tensor of size [batch_size, height, width, filters].
-    num_outputs: The number of output filters.
-    stride: A list of 2 scalars or a 1x2 Tensor indicating the scale,
-      relative to the inputs, of the output dimensions. For example, if kernel
-      size is [2, 3], then the output height and width will be twice and three
-      times the input size.
-    method: The upsampling method: 'nn_upsample_conv',
-      'bilinear_upsample_conv', or 'conv2d_transpose'.
+    net: 形状为 [batch_size, height, width, filters] 的输入张量
+    num_outputs: 输出卷积核数量
+    stride: 包含 2 个元素的列表或张量，表示高度和宽度方向的放大倍数
+    method: 上采样方法：'nn_upsample_conv'、'bilinear_upsample_conv' 或 'conv2d_transpose'
 
   Returns:
-    A Tensor which was upsampled using the specified method.
+    上采样后的张量
 
   Raises:
-    ValueError: if `method` is not recognized.
+    ValueError: 如果 method 不被识别
   """
 
   with tf.variable_scope("upconv"):
@@ -5190,7 +5342,19 @@ def targeted_dropout(inputs,
                      targeting_fn,
                      is_training,
                      do_prune=False):
-  """Applies targeted dropout.
+  """有针对性的 Dropout，用于训练后剪枝（Posthoc Pruning）。
+
+  来自论文 "Targeted Dropout for Posthoc Pruning"（Gomez et al.）。
+  与标准 Dropout 随机选择神经元不同，有针对性 Dropout 优先丢弃
+  那些「权重最小/激活最少」的神经元（由 targeting_fn 确定）。
+
+  这样训练出的模型在剪枝后性能损失较小，因为模型已经学会
+  在没有这些神经元的情况下也能运作。
+
+  训练时：对 targeting_fn 标记为 True 的元素以 1-keep_prob 的概率丢弃
+  推断时：如果 do_prune=True，直接将目标元素置零（真正剪枝）
+
+  Applies targeted dropout.
 
   Applies dropout at a rate of `1 - keep_prob` to only those elements of
   `inputs` marked by `targeting_fn`. See below and paper for more detail:
@@ -5199,20 +5363,15 @@ def targeted_dropout(inputs,
     Kevin Swersky, Yarin Gal, and Geoffrey E. Hinton.
 
   Args:
-    inputs: Tensor, inputs to apply targeted dropout to.
-    k: Scalar Tensor or python scalar, sets the number of elements to target in
-      `inputs`. Must be within `[0, tf.shape(x)[-1]]` and compatible with
-      second argument of `targeting_fn`.
-    keep_prob: Scalar Tensor, passed as `tf.nn.dropout`'s `keep_prob` argument.
-    targeting_fn: callable `fn(inputs, k) -> Boolean Tensor`, produces a
-      boolean mask the same shape as `inputs` where True indicates an element
-      will be dropped, and False not.
-    is_training: bool, indicates whether currently training.
-    do_prune: bool, indicates whether to prune the `k * (1 - keep_prob)`
-      elements of `inputs` expected to be dropped each forwards pass.
+    inputs: 要应用 Dropout 的张量
+    k: 标量张量或 Python 标量，表示要目标的元素数量
+    keep_prob: 保留概率标量，传递给 tf.nn.dropout
+    targeting_fn: 可调用对象 fn(inputs, k) -> 布尔张量，生成与 inputs 相同形状的 mask
+    is_training: 布尔值，表示是否处于训练阶段
+    do_prune: 布尔值，推断时是否真正剪枝目标元素
 
   Returns:
-    Tensor, same shape and dtype as `inputs`.
+    与 inputs 形状和类型相同的张量
   """
   if not is_training and do_prune:
     k = tf.round(to_float(k) * to_float(1. - keep_prob))
